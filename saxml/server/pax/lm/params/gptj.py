@@ -14,8 +14,9 @@
 """Serving model parameters for lm_cloud."""
 
 # OSS import placeholder
-from typing import List
+from typing import Dict, List
 
+import jax
 from jax import numpy as jnp
 from paxml import base_experiment
 from paxml import tasks_lib
@@ -26,7 +27,9 @@ from praxis import pax_fiddle
 from praxis import schedules
 from praxis.layers import activations
 from saxml.server import servable_model_registry
+from saxml.server.pax import quantization
 from saxml.server.pax.lm import layers as sax_layers
+from saxml.server.pax.lm.params import llm_xla_flags
 from saxml.server.pax.lm.params import template
 
 
@@ -35,15 +38,17 @@ from saxml.server.pax.lm.params import template
 class GPTJ(base_experiment.BaseExperiment):
   """GPTJ Transformer LM configuration."""
 
+  # MLPerf sends the tokenized IDs and this is not used with TOKENIZED=True
+  # below. This is a dummy tokenizer to avoid assertion failure in SAX.
   VOCABULARY_CLASS = 'GPT2BPEVocabulary'
   VOCABULARY_PATH = 'gs://saxml-e2e-tests/mlperf-gptj-bpe-vocabulary'
 
-  # Match the HF model tokenizer configs.
+  # Match the HF model tokenizer config.
   SOS_ID = 50256
   EOS_ID = 50256
   EOS_PADDING_AND_NO_SOS = True
 
-  # architecture related
+  # Architecture-related.
   NUM_LAYERS = 28
   VOCAB_SIZE = 50401
   DIMS_PER_HEAD = 256
@@ -59,11 +64,15 @@ class GPTJ(base_experiment.BaseExperiment):
   ACTIVATION_CLS = activations.GELU
   LAYER_NORM_EPSILON = 1.0e-05
 
-  # Sub-class has to specify a mesh.
+  # Compiler options.
+  XLA_TPU_FLAGS: Dict[str, str] = {}
+
+  # Subclasses can specify a different mesh.
   ICI_MESH_SHAPE = [1, 1, 1]
   TRAINING_OPTIMIZED_SHARDING = False
   DCN_MESH_SHAPE = None
   DECODE_MESH_TRANSPOSE = None
+  USE_BATCH_SHARDING = True
   LENGTH_NORM_ALPHA = 0.5
 
   BATCH_SIZE = 1
@@ -85,6 +94,9 @@ class GPTJ(base_experiment.BaseExperiment):
   TOKENS_PER_BEAM = 4
   BATCH_WAIT_SECS = 0.2
   MAX_LIVE_BATCHES = 2
+
+  def compiler_options(self) -> jax.stages.CompilerOptions:
+    return llm_xla_flags.BASE_XLA_TPU_FLAGS | self.XLA_TPU_FLAGS
 
   def datasets(self) -> List[pax_fiddle.Config[base_input.BaseInput]]:
     return []
@@ -140,6 +152,7 @@ class GPTJ(base_experiment.BaseExperiment):
     rotary_position_emb_p.max_position_embeddings = self.MAX_POSITION_EMBEDDINGS
     rotary_position_emb_p.rotary_dim = self.ROTARY_DIM
     transformer_layer_p.tr_atten_tpl.use_rotary_position_emb = True
+    transformer_layer_p.tr_atten_tpl.consolidate_rope_key_state = True
     transformer_layer_p.tr_atten_tpl.rotary_position_emb_tpl = (
         rotary_position_emb_p
     )
@@ -162,6 +175,7 @@ class GPTJ(base_experiment.BaseExperiment):
         task_p,
         mesh_shape=self.ICI_MESH_SHAPE,
         decode_mesh_transpose=self.DECODE_MESH_TRANSPOSE,
+        use_batch_sharding=self.USE_BATCH_SHARDING,
     )
     # Unused.
     lp = task_p.train.learner
@@ -175,7 +189,7 @@ class GPTJ(base_experiment.BaseExperiment):
 
 
 @servable_model_registry.register
-class GPTJ4BF16BS32(GPTJ):
+class GPTJ4INT8BS32(GPTJ):
   """GPTJ Transformer LM tokenized configuration."""
 
   ICI_MESH_SHAPE = [1, 1, 4]
@@ -183,10 +197,8 @@ class GPTJ4BF16BS32(GPTJ):
   FPROP_DTYPE = jnp.bfloat16
   MODEL_DTYPE = jnp.bfloat16
   USE_MATMUL_BEAM_SHUFFLE = True
-  BUCKET_KEYS = [512, 1024, 1919]
+  BUCKET_KEYS = [512, 1024, 1536, 1919]
   MAX_DECODE_STEPS = [32, 64, 128]
-  BATCH_WAIT_SECS = 4.0
-  MAX_LIVE_BATCHES = 6
 
   DECODE_MESH_TRANSPOSE = {
       'fprop_mdl': 'mdl',
@@ -200,8 +212,50 @@ class GPTJ4BF16BS32(GPTJ):
 
 
 @servable_model_registry.register
-class GPTJ4TokenizedBF16BS32(GPTJ4BF16BS32):
+class GPTJ4TokenizedINT8BS32(GPTJ4INT8BS32):
   """GPTJ Transformer LM tokenized configuration."""
 
   TOKENIZED_INPUT = True
   TOKENIZED_OUTPUT = True
+
+@servable_model_registry.register
+@quantization.for_transformer(quantize_on_the_fly=False)
+class GPTJ4TokenizedINT8BS32XLA(GPTJ4TokenizedINT8BS32):
+  """GPTJ Transformer LM tokenized configuration."""
+
+  XLA_TPU_FLAGS = (
+      llm_xla_flags.DEFAULT_FLAGS
+      | llm_xla_flags.CM_FLAGS
+      | llm_xla_flags.DOT_DOT_FLAGS
+      | llm_xla_flags.NEW_TUNED_BS32_FLAGS
+      | llm_xla_flags.STRENGTH_FLAGS
+  )
+
+
+@servable_model_registry.register
+class GPTJ4TokenizedINT8BS32XLAEarly(GPTJ4TokenizedINT8BS32XLA):
+  """GPTJ Transformer LM tokenized configuration."""
+
+  BEAM_SEARCH_EARLY_EXIT = True
+
+
+@servable_model_registry.register
+class GPTJ4TokenizedINT8BS32XLAWait40MB6(GPTJ4TokenizedINT8BS32XLAEarly):
+  """GPTJ Transformer LM tokenized configuration."""
+
+  BATCH_WAIT_SECS = 4.0
+  MAX_LIVE_BATCHES = 10
+
+@servable_model_registry.register
+class GPTJ4TokenizedINT8BS32XLAWait40MB6Offline(GPTJ4TokenizedINT8BS32XLAWait40MB6):
+  """GPTJ Transformer LM tokenized configuration."""
+
+  BATCH_WAIT_SECS = 4.0
+  MAX_LIVE_BATCHES = 10
+
+@servable_model_registry.register
+class GPTJ4TokenizedINT8BS32XLAWait40MB6Server(GPTJ4TokenizedINT8BS32XLAWait40MB6):
+  """GPTJ Transformer LM tokenized configuration."""
+
+  MAX_DECODE_STEPS = [32, 48, 64, 72, 80, 96, 102, 128]
+  BATCH_SIZE = 36

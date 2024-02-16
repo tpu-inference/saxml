@@ -86,10 +86,16 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
+    name = "llm_xla_flags",
+    srcs = ["llm_xla_flags.py"],
+)
+
+pytype_strict_library(
     name = "gptj",
     srcs = ["gptj.py"],
     deps = [
         ":template",
+        ":llm_xla_flags",
         "//saxml/server:servable_model_registry",
         "//saxml/server/pax/lm:layers",
         "//third_party/py/jax",

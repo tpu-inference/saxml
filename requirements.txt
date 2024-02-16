@@ -503,7 +503,7 @@ portalocker==2.8.2
     # via sacrebleu
 portpicker==1.6.0
     # via -r requirements.in
-praxis==1.2.0
+praxis @ git+https://github.com/tpu-inference/praxis@praxis-v1.2.0-mlperf4.0
     # via
     #   -r requirements.in
     #   paxml
