@@ -41,7 +41,7 @@ class GPTJ(base_experiment.BaseExperiment):
   # MLPerf sends the tokenized IDs and this is not used with TOKENIZED=True
   # below. This is a dummy tokenizer to avoid assertion failure in SAX.
   VOCABULARY_CLASS = 'GPT2BPEVocabulary'
-  VOCABULARY_PATH = 'gs://saxml-e2e-tests/mlperf-gptj-bpe-vocabulary'
+  VOCABULARY_PATH = 'gs://cloud-tpu-inference-public/sax-tokenizers/mlperf-gptj-bpe-vocabulary'
 
   # Match the HF model tokenizer config.
   SOS_ID = 50256
