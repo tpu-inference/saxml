@@ -277,33 +277,23 @@ class GPTJ4TokenizedINT8BS32XLAWait40MB6Server(GPTJ4TokenizedINT8BS32XLAWait40MB
   BATCH_SIZE = 36
 
 @servable_model_registry.register
-class GPTJ4TokenizedFP16BS32(GPTJ):
+class GPTJ8TokenizedINT8BS32XLAWait40MB6Offline(GPTJ4TokenizedINT8BS32XLAWait40MB6Offline):
   """GPTJ Transformer LM tokenized configuration."""
-  ICI_MESH_SHAPE = [1, 1, 4]
-  BATCH_SIZE = 32
-  FPROP_DTYPE = jnp.bfloat16
-  MODEL_DTYPE = jnp.bfloat16
-  USE_MATMUL_BEAM_SHUFFLE = True
-  BUCKET_KEYS = [512, 1024, 1536, 1919]
-  MAX_DECODE_STEPS = [32, 64, 128]
-  DECODE_MESH_TRANSPOSE = {
-      'fprop_mdl': 'mdl',
-      'mdl': 'fprop_mdl',
-  }
-  TOKENIZED_INPUT = True
-  TOKENIZED_OUTPUT = True
 
-  VOCAB_SIZE = 50400
-  EXTRA_INPUTS = {
-      'temperature': 0.0,
-      'per_example_max_decode_steps': 128,
-      'per_example_top_k': 100,
-      'per_example_top_p': 0.95,
-  }
-  TOKENS_PER_BEAM = 3
-  MIN_DECODE_STEPS = 35
+  ICI_MESH_SHAPE = [1, 2, 4]
 
   @classmethod
   def serving_mesh_shape(cls) -> list[int]:
     # replica, data_mdl2, mdl, fprop_data, fprop_mdl
-    return [1, 1, 1, 1, 4]
+    return [1, 1, 1, 2, 4]
+
+@servable_model_registry.register
+class GPTJ8TokenizedINT8BS32XLAWait40MB6Server(GPTJ4TokenizedINT8BS32XLAWait40MB6Server):
+  """GPTJ Transformer LM tokenized configuration."""
+
+  ICI_MESH_SHAPE = [1, 2, 4]
+
+  @classmethod
+  def serving_mesh_shape(cls) -> list[int]:
+    # replica, data_mdl2, mdl, fprop_data, fprop_mdl
+    return [1, 1, 1, 2, 4]
