@@ -280,20 +280,20 @@ class GPTJ4TokenizedINT8BS32XLAWait40MB6Server(GPTJ4TokenizedINT8BS32XLAWait40MB
 class GPTJ8TokenizedINT8BS32XLAWait40MB6Offline(GPTJ4TokenizedINT8BS32XLAWait40MB6Offline):
   """GPTJ Transformer LM tokenized configuration."""
 
-  ICI_MESH_SHAPE = [1, 2, 4]
+  ICI_MESH_SHAPE = [1, 1, 8]
 
   @classmethod
   def serving_mesh_shape(cls) -> list[int]:
     # replica, data_mdl2, mdl, fprop_data, fprop_mdl
-    return [1, 1, 1, 2, 4]
+    return [1, 1, 1, 1, 8]
 
 @servable_model_registry.register
 class GPTJ8TokenizedINT8BS32XLAWait40MB6Server(GPTJ4TokenizedINT8BS32XLAWait40MB6Server):
   """GPTJ Transformer LM tokenized configuration."""
 
-  ICI_MESH_SHAPE = [1, 2, 4]
+  ICI_MESH_SHAPE = [1, 1, 8]
 
   @classmethod
   def serving_mesh_shape(cls) -> list[int]:
     # replica, data_mdl2, mdl, fprop_data, fprop_mdl
-    return [1, 1, 1, 2, 4]
+    return [1, 1, 1, 1, 8]
