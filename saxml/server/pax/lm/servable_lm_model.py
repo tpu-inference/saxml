@@ -1321,16 +1321,29 @@ class LMDecodeMethodContinuousBatching(LMDecodeMethod):
     # warmup
     if self.model_state.precompile:
       logging.info('start precompile')
-      _, _, prefix_state = self.prefill_with_dummy()
       slot_in_use = 0
+      _, _, prefix_state = self.prefill_with_dummy()
       self.insert(prefix_state, slot_in_use)
-      self.generate()  # compile w/ left_align_decode_state = False
-      self.decode_state.step = jnp.array(
-          [self.max_decode_steps + self.input_sequence_len - 1], dtype=jnp.int32
-      )
-      self.generate()  # compile w/ left_align_decode_state = True
-      # reset slot 0.
+      for _ in range(2):
+        self.generate()  # compile w/ left_align_decode_state = False
+        self.decode_state.step = jnp.array(
+            [self.max_decode_steps + self.input_sequence_len - 1],
+            dtype=jnp.int32,
+        )
+        self.generate()  # compile w/ left_align_decode_state = True
+      self.prefill_with_dummy()
       self.insert(prefix_state, slot_in_use)
+      # logging.info('start precompile')
+      # _, _, prefix_state = self.prefill_with_dummy()
+      # slot_in_use = 0
+      # self.insert(prefix_state, slot_in_use)
+      # self.generate()  # compile w/ left_align_decode_state = False
+      # self.decode_state.step = jnp.array(
+      #     [self.max_decode_steps + self.input_sequence_len - 1], dtype=jnp.int32
+      # )
+      # self.generate()  # compile w/ left_align_decode_state = True
+      # # reset slot 0.
+      # self.insert(prefix_state, slot_in_use)
 
   # JIT compiled generate function
   def _pjit_device_fn_generate(self):
