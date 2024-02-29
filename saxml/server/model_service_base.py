@@ -280,7 +280,7 @@ class ContinuousBatchingState:
   prefill_queue: queue.SimpleQueue[PrefillRequest]
   prefill_thread: threading.Thread
   generate_thread: threading.Thread
-  post_process_pool: utils.ThreadPool
+  post_process_pools: utils.ThreadPool
   # When a new request is prefilled, prefill_thread uses this conditional
   # variable to signal the availability to generate_thread.
   generate_cv: threading.Condition
@@ -342,10 +342,10 @@ class ContinuousBatchingState:
     # By constraining num_thread=1, we can ensure the operations on
     # state.rpc_tasks are also serializable because utils.ThreadPool
     # runs in FIFO order.
-    self.post_process_pool = utils.ThreadPool(
+    self.post_process_pools = [utils.ThreadPool(
         num_threads=1,
         thread_name_prefix='model_service_runner_post_processer',
-    )
+    ) for _ in range(num_cache_slots)]
     self.generate_cv = threading.Condition()
     self.available_slots = queue.SimpleQueue()
     for i in range(num_cache_slots):
@@ -2131,6 +2131,7 @@ class ModelServicesRunner:
 
         # Must set slots_in_use in the end.
         state.slots_in_use[slot] = 1
+        logging.info('Slots in use are: %d', np.sum(state.slots_in_use))
 
         # Don't wake up the generate thread if there are more pending requests
         # and empty slots.
@@ -2164,7 +2165,7 @@ class ModelServicesRunner:
               'Error occurred: %s, error: %s', state.model_key, e
           )
 
-    state.post_process_pool.run(_postprocess)
+    state.post_process_pools[slot].run(_postprocess)
 
   def _run_generation_loop(
       self,
@@ -2236,48 +2237,49 @@ class ModelServicesRunner:
     if state.method.streamable_output:
       sequences = sequences[:, 1:]
 
-    def _postprocess():
+    def _postprocess(slot, sequence, score):
       # If any of the sequences in the batch is done, return the response
       # and reset the cache slot.
-      output_strings = state.method.detokenize(sequences)
-
-      for idx, slot in enumerate(np.flatnonzero(done)):
-        outputs = [output_strings[idx]], [scores[idx]]
-        if state.method.streamable_output:
-          # send response back to generate_stream
-          resp = copy.deepcopy(state.rpc_tasks[slot].response)
-          self._model_services[state.service_id].FillRPCResponse(
-              state.model_method, outputs, resp
+      output_string = state.method.detokenize(sequence)
+      outputs = [output_string], [score]
+      if state.method.streamable_output:
+        # send response back to generate_stream
+        resp = copy.deepcopy(state.rpc_tasks[slot].response)
+        self._model_services[state.service_id].FillRPCResponse(
+            state.model_method, outputs, resp
+        )
+        try:
+          state.rpc_tasks[slot].done(utils.ok(), resp=resp)
+        except Exception as e:  # pylint: disable=broad-except
+          self._log_exception(
+              'Error occurred: %s, error: %s', state.model_key, e
           )
-          try:
-            state.rpc_tasks[slot].done(utils.ok(), resp=resp)
-          except Exception as e:  # pylint: disable=broad-except
-            self._log_exception(
-                'Error occurred: %s, error: %s', state.model_key, e
-            )
 
-          # send response done back to generate_stream
-          try:
-            state.rpc_tasks[slot].done(utils.ok())
-          except Exception as e:  # pylint: disable=broad-except
-            self._log_exception(
-                'Error occurred: %s, error: %s', state.model_key, e
-            )
-          state.rpc_tasks[slot] = None
-        else:
-          # send response back to generate
-          self._model_services[state.service_id].FillRPCResponse(
-              state.model_method, outputs, state.rpc_tasks[slot].response
+        # send response done back to generate_stream
+        try:
+          state.rpc_tasks[slot].done(utils.ok())
+        except Exception as e:  # pylint: disable=broad-except
+          self._log_exception(
+              'Error occurred: %s, error: %s', state.model_key, e
           )
-          try:
-            state.rpc_tasks[slot].done(utils.ok())
-          except Exception as e:  # pylint: disable=broad-except
-            self._log_exception(
-                'Error occurred: %s, error: %s', state.model_key, e
-            )
-          state.rpc_tasks[slot] = None
+        state.rpc_tasks[slot] = None
+      else:
+        # send response back to generate
+        self._model_services[state.service_id].FillRPCResponse(
+            state.model_method, outputs, state.rpc_tasks[slot].response
+        )
+        try:
+          state.rpc_tasks[slot].done(utils.ok())
+        except Exception as e:  # pylint: disable=broad-except
+          self._log_exception(
+              'Error occurred: %s, error: %s', state.model_key, e
+          )
+        state.rpc_tasks[slot] = None
 
-    state.post_process_pool.run(_postprocess)
+    for idx, slot in enumerate(np.flatnonzero(done)):
+      state.post_process_pools[slot].run(
+          _postprocess, (slot, sequences[idx], scores[idx])
+      )
 
   def _run_secondary_worker_loop(self):
     """Runs the processing loop in secondary hosts in a multi-host setup."""
