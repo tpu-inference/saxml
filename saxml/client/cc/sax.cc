@@ -195,7 +195,8 @@ absl::Status CustomModel::Custom(const ModelOptions& options,
   int outputSize = 0;
   char* errMsgStr = nullptr;
   int errCode = 0;
-  go_custom(model_handle_, const_cast<char*>(request.data()), request.size(),
+  go_custom(model_handle_, options.GetTimeout(),
+            const_cast<char*>(request.data()), request.size(),
             const_cast<char*>(method_name.data()), method_name.size(),
             const_cast<char*>(extraStr.data()), extraStr.size(), &outputStr,
             &outputSize, &errMsgStr, &errCode);
@@ -492,6 +493,43 @@ absl::Status MultimodalModel::Generate(
   return absl::OkStatus();
 }
 
+absl::Status MultimodalModel::Score(
+    const ::sax::server::multimodal::ScoreRequest& request,
+    ::sax::server::multimodal::ScoreResponse* response) const {
+  return MultimodalModel::Score(ModelOptions(), request, response);
+}
+
+absl::Status MultimodalModel::Score(
+    const ModelOptions& options,
+    const ::sax::server::multimodal::ScoreRequest& request,
+    ::sax::server::multimodal::ScoreResponse* response) const {
+  ExtraInputs extra;
+  options.ToProto(&extra);
+  std::string extraStr = "";
+  extra.SerializeToString(&extraStr);
+
+  std::string reqStr = "";
+  request.SerializeToString(&reqStr);
+
+  char* outputStr = nullptr;
+  int outputSize = 0;
+  char* errMsgStr = nullptr;
+  int errCode = 0;
+  go_mm_score(model_handle_, options.GetTimeout(),
+              const_cast<char*>(reqStr.data()), reqStr.size(),
+              const_cast<char*>(extraStr.data()), extraStr.size(), &outputStr,
+              &outputSize, &errMsgStr, &errCode);
+  if (errCode != 0) {
+    return CreateErrorAndFree(errCode, errMsgStr);
+  }
+
+  if (outputStr != nullptr) {
+    response->ParseFromArray(outputStr, outputSize);
+    free(outputStr);
+  }
+  return absl::OkStatus();
+}
+
 MultimodalModel::~MultimodalModel() { go_release_model(model_handle_); }
 
 absl::Status VisionModel::Classify(absl::string_view text,
@@ -645,9 +683,25 @@ absl::Status VisionModel::Detect(absl::string_view image_bytes,
   return VisionModel::Detect(ModelOptions(), image_bytes, text, result);
 }
 
+absl::Status VisionModel::Detect(absl::string_view image_bytes,
+                                 const std::vector<std::string>& text,
+                                 const std::vector<BoundingBox>& boxes,
+                                 std::vector<DetectResult>* result) const {
+  return VisionModel::Detect(ModelOptions(), image_bytes, text, boxes, result);
+}
+
 absl::Status VisionModel::Detect(const ModelOptions& options,
                                  absl::string_view image_bytes,
                                  const std::vector<std::string>& text,
+                                 std::vector<DetectResult>* result) const {
+  return VisionModel::Detect(options, image_bytes, text,
+                             std::vector<BoundingBox>(), result);
+}
+
+absl::Status VisionModel::Detect(const ModelOptions& options,
+                                 absl::string_view image_bytes,
+                                 const std::vector<std::string>& text,
+                                 const std::vector<BoundingBox>& boxes,
                                  std::vector<DetectResult>* result) const {
   ExtraInputs extra;
   options.ToProto(&extra);
@@ -658,6 +712,15 @@ absl::Status VisionModel::Detect(const ModelOptions& options,
   detect_request.mutable_text()->Reserve(text.size());
   for (const auto& one_text : text) {
     detect_request.add_text(one_text);
+  }
+  detect_request.mutable_boxes_of_interest()->Reserve(boxes.size());
+  for (const auto& box : boxes) {
+    ::sax::server::vision::BoundingBox box_of_interest;
+    box_of_interest.set_cx(box.cx);
+    box_of_interest.set_cy(box.cy);
+    box_of_interest.set_w(box.w);
+    box_of_interest.set_h(box.h);
+    detect_request.mutable_boxes_of_interest()->Add(std::move(box_of_interest));
   }
   std::string detectReqStr = "";
   detect_request.SerializeToString(&detectReqStr);
@@ -676,15 +739,17 @@ absl::Status VisionModel::Detect(const ModelOptions& options,
     return CreateErrorAndFree(errCode, errMsgStr);
   }
 
-  // Proto of repeated boundingboxes
+  // Proto of repeated bounding boxes.
   DetectResponse output;
   if (outputStr != nullptr) {
     output.ParseFromArray(outputStr, outputSize);
     free(outputStr);
   }
   for (const auto& res : output.bounding_boxes()) {
-    result->push_back(DetectResult{res.cx(), res.cy(), res.w(), res.h(),
-                                   res.text(), res.score()});
+    result->push_back(DetectResult{
+        res.cx(), res.cy(), res.w(), res.h(), res.text(), res.score(),
+        DetectionMask{res.mask().mask_height(), res.mask().mask_width(),
+                      res.mask().mask_values()}});
   }
   return absl::OkStatus();
 }
@@ -880,18 +945,36 @@ void StartDebugPort(int port) { go_start_debug(port); }
 
 absl::Status Publish(absl::string_view id, absl::string_view model_path,
                      absl::string_view checkpoint_path, int num_replicas) {
-  return Publish(AdminOptions(), id, model_path, checkpoint_path, num_replicas);
+  return Publish(AdminOptions(), id, model_path, checkpoint_path, num_replicas,
+                 {});
 }
 
 absl::Status Publish(const AdminOptions& options, absl::string_view id,
                      absl::string_view model_path,
-                     absl::string_view checkpoint_path, int num_replicas) {
+                     absl::string_view checkpoint_path, int num_replicas,
+                     const std::map<std::string, std::string>& overrides) {
   char* errMsgStr = nullptr;
   int errCode = 0;
+
+  std::vector<char*> override_keys;
+  std::vector<int> override_key_sizes;
+  std::vector<char*> override_values;
+  std::vector<int> override_value_sizes;
+
+  const int num_overrides = overrides.size();
+  for (const auto& [key, value] : overrides) {
+    override_keys.push_back(const_cast<char*>(key.data()));
+    override_key_sizes.push_back(key.size());
+    override_values.push_back(const_cast<char*>(value.data()));
+    override_value_sizes.push_back(value.size());
+  }
+
   go_publish(const_cast<char*>(id.data()), id.size(),
              const_cast<char*>(model_path.data()), model_path.size(),
              const_cast<char*>(checkpoint_path.data()), checkpoint_path.size(),
-             num_replicas, options.timeout, &errMsgStr, &errCode);
+             num_replicas, options.timeout, num_overrides, override_keys.data(),
+             override_key_sizes.data(), override_values.data(),
+             override_value_sizes.data(), &errMsgStr, &errCode);
   if (errCode != 0) {
     return CreateErrorAndFree(errCode, errMsgStr);
   }

@@ -71,14 +71,17 @@ func ListAll(ctx context.Context) ([]string, error) {
 }
 
 // Create creates a Sax cell.
-func Create(ctx context.Context, saxCell, adminACL string) error {
+func Create(ctx context.Context, saxCell, writeACL string) error {
 	path, err := Path(ctx, saxCell)
 	if err != nil {
 		return err
 	}
+	if !env.Get().InTest(ctx) && writeACL == "" {
+		return fmt.Errorf("cell must be created with a non-empty write ACL: %w", errors.ErrInvalidArgument)
+	}
 
 	log.Infof("Creating directory %q", path)
-	if err := env.Get().CreateDir(ctx, path, adminACL); err != nil {
+	if err := env.Get().CreateDir(ctx, path, writeACL); err != nil {
 		return err
 	}
 
@@ -91,6 +94,28 @@ func Create(ctx context.Context, saxCell, adminACL string) error {
 		log.Info("Creating...")
 	}
 	log.Infof("Created directory %q", path)
+
+	return nil
+}
+
+// Delete deletes a Sax cell.
+func Delete(ctx context.Context, saxCell string) error {
+	path, err := Path(ctx, saxCell)
+	if err != nil {
+		return err
+	}
+
+	log.Infof("Deleting directory %q", path)
+	if err := env.Get().DeleteDir(ctx, path); err != nil {
+		return err
+	}
+
+	// Double-check the invariant.
+	time.Sleep(time.Second)
+	if err := Exists(ctx, saxCell); err == nil {
+		return fmt.Errorf("Failed to delete %q: %w", path, errors.ErrInternal)
+	}
+	log.Infof("Deleted directory %q", path)
 
 	return nil
 }

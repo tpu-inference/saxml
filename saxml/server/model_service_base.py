@@ -18,6 +18,7 @@ import asyncio
 import collections
 import copy
 import dataclasses
+import enum
 import functools
 import json
 import queue
@@ -31,6 +32,8 @@ import uuid
 from absl import logging
 import grpc
 from grpc_reflection.v1alpha import reflection
+import jaxtyping as jt
+import numpy as np
 from saxml.common.python import location
 from saxml.protobuf import admin_pb2
 from saxml.protobuf import common_pb2
@@ -43,25 +46,22 @@ from saxml.server import proto_util
 from saxml.server import servable_model
 from saxml.server import servable_model_params
 from saxml.server import servable_model_registry
+from saxml.server import spmd_backend
 from saxml.server import utils
 from saxml.server import validate
-from saxml.server.spmd_backend import SingleHostBackend
-from saxml.server.spmd_backend import SPMDBackend
 
 from google.protobuf import message
+
 
 DeviceTensors = servable_model.DeviceTensors
 InputShapeInfo = servable_model.InputShapeInfo
 Closure = Callable[[], None]
 StatusCallback = utils.StatusCallback
 
-# TODO(zhifengc): Convert these an enum to enforce stronger typing.
-_LOAD_METHOD_KEY = '_internal_load'
-_UNLOAD_METHOD_KEY = '_internal_unload'
-_EXPORT_METHOD_KEY = '_internal_export'
-_TERMINATE_METHOD_KEY = '_internal_terminate'
-_KEEP_DEVICES_WARM_METHOD_KEY = '_internal_keep_devices_warm'
-_SAVE_MODEL_KEY = '_internal_save'
+Int = jt.Int
+Float = jt.Float
+Array = jt.Array
+
 
 # Global variable for the service registry: mapping {key: list_of_services}.
 # The value is a list because we allow both gRPC and Stubby services registered.
@@ -69,6 +69,9 @@ _SERVICE_REGISTRY = {}
 
 # All SAX names must be prefixed with this.
 _SAX_PREFIX = '/sax/'
+
+# Keep warm for every 2 minutes
+_KEEP_WARM_SECONDS = 120
 
 # pylint: disable=invalid-name
 
@@ -99,17 +102,50 @@ def _maybe_all_cancelled(
   return False
 
 
+@enum.unique
+class MethodName(str, enum.Enum):
+  """Sax method types."""
+
+  # Sax internal methods
+  LOAD = enum.auto()
+  UNLOAD = enum.auto()
+  EXPORT = enum.auto()
+  TERMINATE = enum.auto()
+  KEEP_DEVICES_WARM = enum.auto()
+  SAVE = enum.auto()
+
+  # Model method
+  MODEL = enum.auto()
+
+  # Method with continuous batching.
+  BATCHED_LM_GENERATE = enum.auto()
+
+  # For stats and secondary host initialization
+  PREFILL_INSERT = enum.auto()
+  GENERATE = enum.auto()  # Secondary hosts only
+
+  def __str__(self):
+    return self.name.lower()
+
+
 @dataclasses.dataclass(frozen=True)
 class MethodKey:
   """Method key.
 
   Methods here can be from different models, and their keys are represented as a
-  tuple of (method_name, service_id, model_key) in this module.
+  tuple of (method_name, model_method, service_id, model_key) in this
+  module.
   """
 
-  name: str
+  name: MethodName
+  model_method: Optional[str] = None
   service_id: Optional[str] = None
   model_key: Optional[str] = None
+
+  def method_name(self) -> str | None:
+    if self.name == MethodName.MODEL:
+      return self.model_method
+    return str(self.name)
 
 
 class Method:
@@ -172,15 +208,21 @@ class Batch:
 
   method: MethodKey
   rpc_tasks: Sequence[utils.RpcQueueTask]
-  input_tensors: Optional[DeviceTensors]
   done: Closure  # Must be called when the batch is done processing.
+
+  input_tensors: Optional[DeviceTensors] = None
   ready: bool = False
   cv: threading.Condition = threading.Condition()
   # Whether to skip the asynchronous host-based multi-host sync, and use the
   # synchronous device-based sync only. This is used when there is no unfinished
   # batch in queue to overlap with async host sync.
   skip_host_sync: bool = False
-  unpadded_shape: InputShapeInfo = InputShapeInfo()
+
+  # Exactly one of these two fields should be filled in with a not-None value
+  # before the batch is used. In addition, padded_shape is None if and only if
+  # input_tensors is None.
+  unpadded_shape: InputShapeInfo | None = None
+  padded_shape: InputShapeInfo | None = None
 
   def size(self):
     return len(self.rpc_tasks)
@@ -205,6 +247,134 @@ class Batch:
 
   def __exit__(self, exc_type, exc_value, tb):
     self.finish()
+
+
+@dataclasses.dataclass
+class PrefillRequest:
+  """Prefill request.
+
+  A transient object created after an lm.generate or lm.generate_stream RPC
+  request's inputs are pre-processed and destroyed when an empty cache slot
+  takes its content.
+  """
+
+  preprocessed_inputs: DeviceTensors | None
+  rpc_tasks: Sequence[utils.RpcQueueTask]
+  enqueue_time: float
+
+
+@dataclasses.dataclass
+class ContinuousBatchingState:
+  """Continuous batching state of a model method."""
+
+  method: servable_model.ServableMethod
+  model_key: str
+  model_method: str
+  service_id: str
+  num_cache_slots: int
+  max_decode_steps: int
+
+  # Prefill requests are enqueued here after getting successfully pre-processed
+  # on the primary host. When cache slots become available, dequeue requests
+  # from this queue in the prefill loop.
+  prefill_queue: queue.SimpleQueue[PrefillRequest]
+  prefill_thread: threading.Thread
+  generate_thread: threading.Thread
+  post_process_pool: utils.ThreadPool
+  # When a new request is prefilled, prefill_thread uses this conditional
+  # variable to signal the availability to generate_thread.
+  generate_cv: threading.Condition
+  # prefill_thread gets blocked when available_slots reaches empty, until
+  # generate_thread releases a cache slot when it finishes a request.
+  available_slots: queue.SimpleQueue[int]
+  # Set by prefill_thread when there are pending requests and slots to insert.
+  pending_insert: bool
+  # RPC tasks for requests being actively processed. One entry per cache slot.
+  # Entries are filled in when a request leaves prefill_queue and freed when
+  # the lm.generate / lm.generate_stream RPC is fulfilled.
+  rpc_tasks: list[utils.RpcQueueTask | None]
+
+  # Decoded tokens, left aligned.
+  decoded_tokens: Int[Array, 'B T']
+  # Sum of log probabilities across prefilled and decoded tokens.
+  scores: Float[Array, 'B']
+  # Number of steps decoded.
+  steps: Int[Array, 'B']
+  # Whether each cache slot is being used (1) or unused (0).
+  slots_in_use: Int[Array, 'B']
+
+  # Stats.
+  prefill_wait_time: utils.RequestStats
+  insert_wait_time: utils.RequestStats
+  generate_step_time: utils.RequestStats
+  recent_waiting_prefills: Deque[int]
+  recent_slots_in_use: Deque[int]
+
+  def __init__(
+      self,
+      method: servable_model.ServableMethod,
+      model_key: str,
+      model_method: str,
+      service_id: str,
+      num_cache_slots: int,
+      max_decode_step: int,
+      prefill_fn: Callable[..., None],
+      generate_fn: Callable[..., None],
+  ):
+    self.method = method
+    self.model_key = model_key
+    self.model_method = model_method
+    self.service_id = service_id
+    self.num_cache_slots = num_cache_slots
+    self.max_decode_steps = max_decode_step
+
+    self.prefill_queue: queue.SimpleQueue[PrefillRequest] = queue.SimpleQueue()
+    self.rpc_tasks = [None] * num_cache_slots
+
+    # TODO(changlan): Properly handle shutdown
+    self.prefill_thread = threading.Thread(
+        target=prefill_fn, args=(self,), daemon=True
+    )
+    self.generate_thread = threading.Thread(
+        target=generate_fn, args=(self,), daemon=True
+    )
+
+    # By constraining num_thread=1, we can ensure the operations on
+    # state.rpc_tasks are also serializable because utils.ThreadPool
+    # runs in FIFO order.
+    self.post_process_pool = utils.ThreadPool(
+        num_threads=1,
+        thread_name_prefix='model_service_runner_post_processor',
+    )
+    self.generate_cv = threading.Condition()
+    self.available_slots = queue.SimpleQueue()
+    for i in range(num_cache_slots):
+      self.available_slots.put(i)
+    self.pending_insert = False
+
+    self.decoded_tokens = np.zeros(
+        (num_cache_slots, max_decode_step), dtype=np.int32
+    )
+    self.scores = np.zeros((num_cache_slots,))
+    self.steps = np.zeros((num_cache_slots,), dtype=np.int32)
+    self.slots_in_use = np.zeros((num_cache_slots,), dtype=np.int32)
+
+    self.prefill_wait_time = utils.RequestStats(timespan_sec=np.float64(60.0))
+    self.insert_wait_time = utils.RequestStats(timespan_sec=np.float64(60.0))
+    self.generate_step_time = utils.RequestStats(timespan_sec=np.float64(60.0))
+    self.recent_waiting_prefills = collections.deque()
+    self.recent_slots_in_use = collections.deque()
+
+  def update_stats(self, prefill_wait_time: float, insert_wait_time: float):
+    """Update RPC stats."""
+    self.prefill_wait_time.add(prefill_wait_time)
+    self.insert_wait_time.add(insert_wait_time)
+    self.recent_waiting_prefills.append(self.prefill_queue.qsize())
+    if len(self.recent_waiting_prefills) > 10:
+      self.recent_waiting_prefills.popleft()
+    self.recent_slots_in_use.append(np.count_nonzero(self.slots_in_use))
+    if len(self.recent_slots_in_use) > 10:
+      self.recent_slots_in_use.popleft()
 
 
 class PerMethodBatcher:
@@ -286,9 +456,7 @@ class PerMethodBatcher:
         batch = Batch(
             key,
             rpc_tasks,
-            None,
             _finish_batch,
-            unpadded_shape=InputShapeInfo(batch_size=len(rpc_tasks)),
         )
         # If there is no other unprocessed batch, we enqueue to batch before
         # preprocessing finishes.
@@ -299,12 +467,24 @@ class PerMethodBatcher:
           presync = can_presync and batch.skip_host_sync
           self._global_live_batches += 1
           if presync:
+            # For presync, we haven't pre-processed the input yet. So we have
+            # to send the unpadded batch size to let secondary hosts pad their
+            # dummy inputs to the next supported batch size.
+            assert batch.input_tensors is None
+            batch.unpadded_shape = InputShapeInfo(batch_size=len(rpc_tasks))
+            assert batch.padded_shape is None
             self._batch_queue.put(batch)
         if preprocess_fn is None:
           batch.mark_as_ready()
         else:
+          # Initialize input_tensors to None to indicate failed pre-processing.
+          input_tensors = None
+          unpadded_shape = InputShapeInfo(batch_size=len(rpc_tasks))
+          padded_shape = None
           try:
-            input_tensors, unpadded_shape = preprocess_fn(rpc_tasks)
+            # Change these three values all at once or not at all.
+            input_tensors, padded_shape = preprocess_fn(rpc_tasks)
+            unpadded_shape = None
           except Exception as e:  # pylint: disable=broad-except
             # Catch arbitrary exception and propagate the error to the client
             # without crashing the server.
@@ -312,15 +492,15 @@ class PerMethodBatcher:
             logging.error(error_msg)
             for rpc_task in rpc_tasks:
               rpc_task.done(utils.internal_error(error_msg))
-            # Set input_tensors to None to indicate failed preprocess.
-            input_tensors = None
-            unpadded_shape = InputShapeInfo(batch_size=len(rpc_tasks))
             if not presync:
               _finish_batch()
             continue
           finally:
+            # Regardless of whether pre-processing succeeded, assign these three
+            # values to batch while observing its invariance.
             batch.input_tensors = input_tensors
             batch.unpadded_shape = unpadded_shape
+            batch.padded_shape = padded_shape
             batch.mark_as_ready()
         if not presync:
           self._batch_queue.put(batch)
@@ -356,6 +536,7 @@ class PerMethodBatcher:
           MethodKey,
           utils.RequestStats.Stats,
           utils.RequestStats.Stats,
+          int,
           List[int],
       ]
   ]:
@@ -367,6 +548,7 @@ class PerMethodBatcher:
           mkey,
           method.ok_stats.get(100),
           method.err_stats.get(1),
+          method.batch_size,
           list(method.recent_batch_sizes),
       ))
     return ret
@@ -382,8 +564,8 @@ class PerMethodBatcher:
     """Adds an item to the method's queue."""
     start_ts = time.time()
     method = self._per_method_queues.get(key)
-    tc = utils.get_current_trace_printer()
-    tc(f'Add item {key}')
+    trace_callback = utils.get_current_trace_printer()
+    trace_callback(f'Add item {key}')
 
     def done(status, *args, **kwargs):
       """Helper to run the done callback if it's not None."""
@@ -399,21 +581,26 @@ class PerMethodBatcher:
       return done(utils.not_found(f'method {key} is unloaded'))
 
     # Check ACLs.
-    model: servable_model.ServableModel = method.model
-    if model is not None:
-      aclname: Optional[str] = model.get_acl(key.name)
+    model: servable_model.ServableModel | None = method.model
+
+    if model is not None and key.model_method is not None:
+      model_method_name: str = key.model_method
+
+      aclname: Optional[str] = model.get_acl(model_method_name)
       username: Optional[str] = rpc.username() if rpc is not None else None
       acl_ok = acl.Check(aclname, username)
-      tc(f'Username {username} ACL {aclname} check result {acl_ok}')
+      trace_callback(f'Username {username} ACL {aclname} check result {acl_ok}')
       if not acl_ok:
         return done(
             utils.permission_denied(
-                f'Model {key.model_key} method {key.name} acl {aclname}'
-                f' disallows {username}'
+                f'Model {key.model_key} method {model_method_name} acl'
+                f' {aclname} disallows {username}'
             )
         )
       # Check if extra_input keys are in servable_method.default_extra_inputs.
-      servable_method: servable_model.ServableMethod = model.method(key.name)
+      servable_method: servable_model.ServableMethod = model.method(
+          model_method_name
+      )
       validate_status = validate.ValidateRequestForExtraInputs(
           req, servable_method.default_extra_inputs
       )
@@ -433,7 +620,7 @@ class PerMethodBatcher:
       done(status, *args, **kwargs)
       method.admissioner.release()
 
-    method.queue.send(rpc, req, resp, _done, tc)
+    method.queue.send(rpc, req, resp, _done, trace_callback)
 
   def get_batch(self) -> Batch:
     """Dequeues an available batch."""
@@ -483,7 +670,7 @@ class LoadedModelManager:
       ckpt_path: Path of the checkpoint.
       acls: ACL names for this model's methods.
       overrides: Overrides that can be used for dynamic reconfiguration of
-        params. Values must be serialized JSONs.
+        params.
       prng_key: PRNG key for this model.
       register_methods_callback: Optional callback to initialize model methods.
 
@@ -498,16 +685,15 @@ class LoadedModelManager:
     try:
       model_class = servable_model_registry.get(model_path)
       if model_class is None:
-        raise ValueError(f'Could not find servable model `{model_path}`.')
+        raise ValueError(
+            f'Could not find servable model {model_path} in'
+            f' {servable_model_registry.get_all().keys()}.'
+        )
       if not issubclass(model_class, servable_model_params.ServableModelParams):
         raise ValueError(f'{model_path} is not a ServableModelParams')
       # pytype: disable=not-instantiable
       params = model_class()
-      parsed_overrides = {
-          key: json.loads(value) for key, value in overrides.items()
-      }
-      logging.info('model_service_base overrides= %s', parsed_overrides)
-      params.apply_model_overrides(parsed_overrides)
+      params.apply_model_overrides(overrides)
       loaded = params.load(key, ckpt_path, self._primary_process_id, prng_key)
       # pytype: enable=not-instantiable
       loaded.set_acls(acls)
@@ -576,6 +762,9 @@ class LoadedModelManager:
   def get_model(self, key: str) -> servable_model.ServableModel:
     return self._models[key]
 
+  def get_models(self) -> Dict[str, servable_model.ServableModel]:
+    return self._models
+
   def get_model_metadata(self, key: str) -> Mapping[str, Any]:
     return self._model_metadata[key]
 
@@ -629,7 +818,7 @@ class ModelService(metaclass=abc.ABCMeta):
       req: message.Message,
       resp: message.Message,
       done: StatusCallback,
-      streaming: bool,
+      streaming_output: bool,
   ):
     """Enqueues a request to the processing loop."""
     # Request may arrive before the corresponding _load_model() finishes or
@@ -649,13 +838,33 @@ class ModelService(metaclass=abc.ABCMeta):
       return
 
     # The method may not support streaming.
-    if streaming:
-      if not method_obj.streamable:
-        done(utils.invalid_arg(f'Method {method} does not support streaming'))
-        logging.error('Method %s does not support streaming', method)
-        return
+    if streaming_output and not method_obj.streamable_output:
+      done(
+          utils.invalid_arg(
+              f'Method {method} does not support streaming output.'
+          )
+      )
+      logging.error('Method %s does not support streaming output.', method)
+      return
 
-    batcher_item_key = MethodKey(method, self._service_id, model_key)
+    # Only lm.generate supports continuous batching.
+    if method_obj.continuous_batching:
+      if method in ['lm.generate', 'lm.generate_stream']:
+        batcher_item_key = MethodKey(
+            MethodName.BATCHED_LM_GENERATE, method, self._service_id, model_key
+        )
+      else:
+        done(
+            utils.invalid_arg(
+                f'Method {method} does not support continuous batching.'
+            )
+        )
+        logging.error('Method %s does not support continuous batching.', method)
+        return
+    else:
+      batcher_item_key = MethodKey(
+          MethodName.MODEL, method, self._service_id, model_key
+      )
     self._batcher.add_item(batcher_item_key, rpc_context, req, resp, done)
 
 
@@ -697,7 +906,7 @@ class ModelServiceGRPC(ModelService):
         req,
         resp,
         _done,
-        streaming=False,
+        streaming_output=False,
     )
     return fut
 
@@ -732,7 +941,7 @@ class ModelServiceGRPC(ModelService):
         req,
         empty_resp,
         _done,
-        streaming=True,
+        streaming_output=True,
     )
 
     return q
@@ -766,6 +975,7 @@ class ModeletService:
       admin_port: Optional[int],
       platform_chip: Optional[str],
       platform_topology: Optional[str],
+      tags: Optional[List[str]],
       *args,
       **kwargs,
   ):
@@ -777,16 +987,16 @@ class ModeletService:
 
     super().__init__(*args, **kwargs)
     self._batcher.register_method(
-        None, MethodKey(_LOAD_METHOD_KEY), batch_size=1, max_live_batches=4
+        None, MethodKey(MethodName.LOAD), batch_size=1, max_live_batches=4
     )
     self._batcher.register_method(
-        None, MethodKey(_UNLOAD_METHOD_KEY), batch_size=1, max_live_batches=4
+        None, MethodKey(MethodName.UNLOAD), batch_size=1, max_live_batches=4
     )
     self._batcher.register_method(
-        None, MethodKey(_EXPORT_METHOD_KEY), batch_size=1, max_live_batches=1
+        None, MethodKey(MethodName.EXPORT), batch_size=1, max_live_batches=1
     )
     self._batcher.register_method(
-        None, MethodKey(_SAVE_MODEL_KEY), batch_size=1, max_live_batches=1
+        None, MethodKey(MethodName.SAVE), batch_size=1, max_live_batches=1
     )
 
     self._platform_chip = proto_util.to_chip_type(platform_chip)
@@ -802,19 +1012,19 @@ class ModeletService:
           self._platform_chip
           == admin_pb2.ModelServer.ChipType.CHIP_TYPE_UNKNOWN
       ):
-        raise ValueError('chip type unknown')
+        raise ValueError('Chip type unknown')
       if (
           self._platform_topology
           == admin_pb2.ModelServer.ChipTopology.CHIP_TOPOLOGY_UNKNOWN
       ):
-        raise ValueError('chip topology unknown')
+        raise ValueError('Chip topology unknown')
     # If self._sax_cell is set to not None below, loadable model paths will get
     # imported, and location.Join will be called after the server starts.
     self._sax_cell = None
     self._admin_port = None
     if sax_cell is not None:
       if not sax_cell.startswith(_SAX_PREFIX):
-        raise ValueError(f'Invalid sax_cell {sax_cell}, should be /sax/<cell>')
+        raise ValueError(f'Invalid sax_cell {sax_cell}. Should be /sax/<cell>')
       self._sax_cell = sax_cell
       self._admin_port = admin_port
 
@@ -833,6 +1043,7 @@ class ModeletService:
           logging.info('Servable model alias %s for %s', alias, k)
           self._loadable_model_paths.append(alias)
 
+    self._tags = tags
     self._ipport = ipaddr.Join(ipaddr.MyIPAddr(), service_port)
     self._debug_addr = (
         '' if debug_port is None else ipaddr.Join(ipaddr.MyIPAddr(), debug_port)
@@ -852,12 +1063,14 @@ class ModeletService:
           chip_type=self._platform_chip,
           chip_topology=self._platform_topology,
           servable_model_paths=list(self._loadable_model_paths),
+          tags=self._tags
       )
       try:
         location.Join(
             self._sax_cell,
             self._ipport,
             self._debug_addr,
+            '',  # data_addr
             specs.SerializeToString(),
             admin_port=self._admin_port,
         )
@@ -875,7 +1088,7 @@ class ModeletService:
   ) -> None:
     """Loads a model."""
     self._batcher.add_item(
-        MethodKey(_LOAD_METHOD_KEY), rpc_context, req, resp, done_with_status
+        MethodKey(MethodName.LOAD), rpc_context, req, resp, done_with_status
     )
 
   def update(
@@ -905,7 +1118,7 @@ class ModeletService:
       if req.model_key in self._models_being_unloaded:
         done_with_status(
             utils.invalid_arg(
-                f'Model already being unloaded. Key: {req.model_key}'
+                f'Model is already being unloaded. Key: {req.model_key}'
             )
         )
         return
@@ -921,6 +1134,7 @@ class ModeletService:
       for method_name in model.methods:
         self._batcher.unregister_method(
             MethodKey(
+                MethodName.MODEL,
                 method_name,
                 model.method(method_name).service_id(),
                 req.model_key,
@@ -928,7 +1142,7 @@ class ModeletService:
         )
 
     self._batcher.add_item(
-        MethodKey(_UNLOAD_METHOD_KEY), rpc_context, req, resp, done_with_status
+        MethodKey(MethodName.UNLOAD), rpc_context, req, resp, done_with_status
     )
     with self._unload_lock:
       self._models_being_unloaded.remove(req.model_key)
@@ -942,7 +1156,7 @@ class ModeletService:
   ) -> None:
     """Exports a model to a serialized format."""
     self._batcher.add_item(
-        MethodKey(_EXPORT_METHOD_KEY), rpc_context, req, resp, done_with_status
+        MethodKey(MethodName.EXPORT), rpc_context, req, resp, done_with_status
     )
 
   def save(
@@ -954,7 +1168,7 @@ class ModeletService:
   ) -> None:
     """Save a model."""
     self._batcher.add_item(
-        MethodKey(_SAVE_MODEL_KEY), rpc_context, req, resp, done_with_status
+        MethodKey(MethodName.SAVE), rpc_context, req, resp, done_with_status
     )
 
   def get_status(
@@ -963,15 +1177,44 @@ class ModeletService:
       resp: modelet_pb2.GetStatusResponse,
   ) -> None:
     """Retrieves the server status."""
+    model_by_key: dict[str, modelet_pb2.GetStatusResponse.ModelWithStatus] = {}
     for key, status in self._loader.get_status().items():
       model = modelet_pb2.GetStatusResponse.ModelWithStatus(
           model_key=key, model_status=status
       )
+      model_by_key[key] = model
       if (
           status == common_pb2.ModelStatus.FAILED
           and req.include_failure_reasons
       ):
         model.failure_reason = self._loader.get_error(key)
+
+    if req.include_method_stats:
+      for (
+          key,
+          ok_stats,
+          err_stats,
+          _,
+          recent_batch_sizes,
+      ) in self._batcher.get_method_stats():
+        if (
+            key.service_id
+            and (model := model_by_key.get(key.model_key)) is not None
+        ):
+          stats = model.method_stats.add(
+              method=key.method_name(),
+              errors_per_second=err_stats.rate(),
+              successes_per_second=ok_stats.rate(),
+              recent_batch_sizes=recent_batch_sizes,
+          )
+          if np.size(ok_stats.samples) > 0:
+            stats.mean_latency_on_success_per_second = ok_stats.mean()
+            percentiles = np.percentile(ok_stats.samples, [50, 95, 99])
+            stats.p50_latency_on_success_per_second = percentiles[0]
+            stats.p95_latency_on_success_per_second = percentiles[1]
+            stats.p99_latency_on_success_per_second = percentiles[2]
+
+    for model in model_by_key.values():
       resp.models.append(model)
 
 
@@ -1089,7 +1332,8 @@ class ModelServicesRunner:
       admin_port: Optional[int] = None,
       platform_chip: Optional[str] = None,
       platform_topology: Optional[str] = None,
-      spmd_backend: Optional[SPMDBackend] = None,
+      tags: Optional[List[str]] = None,
+      backend: Optional[spmd_backend.SPMDBackend] = None,
       fail_on_error: bool = False,
   ):
     self._is_primary = is_primary_process
@@ -1099,7 +1343,7 @@ class ModelServicesRunner:
     self._batcher = PerMethodBatcher()
     self._batcher.register_method(
         None,
-        MethodKey(_KEEP_DEVICES_WARM_METHOD_KEY, '_no_service_id', '_no_model'),
+        MethodKey(MethodName.KEEP_DEVICES_WARM),
         batch_size=1,
         max_live_batches=1,
     )
@@ -1107,15 +1351,17 @@ class ModelServicesRunner:
         logging.fatal if fail_on_error else logging.error, exc_info=True
     )
 
-    if spmd_backend is None:
+    if backend is None:
       if not self._is_primary:
         raise NotImplementedError('No spmd_backend provided for multi-host.')
-      self._spmd_backend = SingleHostBackend()
+      self._spmd_backend = spmd_backend.SingleHostBackend()
     else:
-      self._spmd_backend = spmd_backend
+      self._spmd_backend = backend
+
     if self._is_primary:
-      self._pool = utils.ThreadPool(
-          num_threads=16, thread_name_prefix='model_service_runner'
+      # Thread pool for async postprocess on the host.
+      self._postprocess_pool = utils.ThreadPool(
+          num_threads=16, thread_name_prefix='model_service_runner_postprocess'
       )
 
       # Device execution ensures the enqueue operations of streaming outputs
@@ -1126,6 +1372,7 @@ class ModelServicesRunner:
           num_threads=1,
           thread_name_prefix='model_service_runner_stream_dequeuer',
       )
+
       primary_host = self._spmd_backend.spmd_host_index()
       if self._spmd_backend.spmd_host_count() > 1:
         self._spmd_backend.send_via_device(str(primary_host))
@@ -1139,9 +1386,15 @@ class ModelServicesRunner:
           daemon=True,
           name='model_service_runner_keep_warm',
       )
+
+      # For continuous batching
+      # Indexed by (model_key, method_name)
+      self._continuous_batching_state: Dict[
+          tuple[str, str], ContinuousBatchingState
+      ] = dict()
+      # Global lock for device computation
+      self._device_compute_mutex: threading.Lock = threading.Lock()
     else:
-      self._pool = None
-      self._stream_pool = None
       primary_id_str = self._spmd_backend.receive_via_device()
       primary_host = int(primary_id_str)
       logging.info('Secondary worker loop. Primary process: %d', primary_host)
@@ -1150,9 +1403,10 @@ class ModelServicesRunner:
           daemon=False,
           name='model_service_runner_secondary_worker',
       )
+
     self._loaded_models = LoadedModelManager(primary_host)
     self._batcher.register_method(
-        None, MethodKey(_TERMINATE_METHOD_KEY), batch_size=1, max_live_batches=1
+        None, MethodKey(MethodName.TERMINATE), batch_size=1, max_live_batches=1
     )
     self._modelet_service = ModeletServiceGRPC(
         port,
@@ -1163,6 +1417,7 @@ class ModelServicesRunner:
         admin_port=admin_port,
         platform_chip=platform_chip,
         platform_topology=platform_topology,
+        tags=tags
     )
     self._platform_topology = platform_topology
     all_grpc_services = [self._modelet_service]
@@ -1237,15 +1492,11 @@ class ModelServicesRunner:
 
   def _run_keep_warm_loop(self):
     while True:
-      self._batcher.add_item(
-          MethodKey(
-              _KEEP_DEVICES_WARM_METHOD_KEY, '_no_service_id', '_no_model'
-          )
-      )
-      time.sleep(120)  # 2 minutes
+      self._batcher.add_item(MethodKey(MethodName.KEEP_DEVICES_WARM))
+      time.sleep(_KEEP_WARM_SECONDS)
 
   @property
-  def spmd_backend(self) -> SPMDBackend:
+  def spmd_backend(self) -> spmd_backend.SPMDBackend:
     return self._spmd_backend
 
   @property
@@ -1302,13 +1553,12 @@ class ModelServicesRunner:
     return uuid.uuid4().int & ((1 << 63) - 1)
 
   def _encode_message(self, *msgs: str) -> str:
-    assert msgs
-    for m in msgs:
-      assert '|' not in m
-    return '|'.join(msgs)
+    return json.dumps(msgs)  # tuples are serialized as lists in JSON.
 
   def _decode_message(self, encoded: str) -> List[str]:
-    return encoded.split('|')
+    msgs = json.loads(encoded)
+    assert isinstance(msgs, list)
+    return msgs
 
   def _load_model(
       self,
@@ -1323,49 +1573,80 @@ class ModelServicesRunner:
     if self._loaded_models.contains(model_key):
       return
 
-    def register_methods(model):
+    def register_methods(model: servable_model.ServableModel):
       for method_name in model.methods:
         method = model.method(method_name)
         service_id = method.service_id()
         service = self._model_services[service_id]
 
-        def _pre_process_inputs(
-            rpc_tasks, method=method, method_name=method_name, service=service
+        def preprocess_rpc_tasks(
+            rpc_tasks: Sequence[utils.RpcQueueTask],
+            method=method,
+            method_name=method_name,
+            service=service,
+            prefill=False,
         ):
-          utils.traceprint_all(rpc_tasks, 'Before pre_processing')
-          inputs = method.pre_processing(
-              [
-                  service.ParseMethodRPCRequest(method_name, t.request)
-                  for t in rpc_tasks
-              ]
-          )
-          unpadded_shape = method.get_unpadded_shape(len(rpc_tasks), inputs)
-
-          extra_inputs = []
-          for t in rpc_tasks:
-            request_extra_inputs = method.get_extra_inputs_from_request_inputs(
-                t.request
-            )
-            extra_inputs.append(request_extra_inputs)
-
+          inputs = method.pre_processing([
+              service.ParseMethodRPCRequest(method_name, t.request)
+              for t in rpc_tasks
+          ])
+          extra_inputs = [
+              method.get_extra_inputs_from_request_inputs(t.request)
+              for t in rpc_tasks
+          ]
           inputs = method.update_extra_inputs(
               inputs, len(rpc_tasks), extra_inputs
           )
-          utils.traceprint_all(rpc_tasks, 'After pre_processing')
-          res = method.input_to_device(inputs, unpadded_shape)
-          utils.traceprint_all(rpc_tasks, 'After input_to_device')
-          return res, unpadded_shape
+
+          unpadded_shape = method.get_unpadded_shape(len(rpc_tasks), inputs)
+          padded_shape = method.get_padded_input_shape(unpadded_shape)
+          if prefill:
+            res = method.input_to_device_for_continuous_batching(
+                inputs, unpadded_shape, padded_shape
+            )
+          else:
+            res = method.input_to_device(inputs, unpadded_shape, padded_shape)
+          return res, padded_shape
+
+        method_key = MethodKey(
+            MethodName.MODEL, method_name, service_id, model_key
+        )
 
         self._batcher.register_method(
             model,
-            MethodKey(method_name, service_id, model_key),
+            method_key,
             method.batch_size,
-            preprocess_fn=_pre_process_inputs,
+            preprocess_fn=preprocess_rpc_tasks,
             max_live_batches=method.max_live_batches,
             batching_wait_secs=method.batching_wait_secs,
         )
 
-    self._loaded_models.load(
+        # If a method supports continuous batching, additionally register the
+        # continuous batching variation of the method.
+        if method.continuous_batching:
+          # Currently, only lm.generate and lm.generate_stream supports
+          # continuous batching.
+          if method_name not in ['lm.generate', 'lm.generate_stream']:
+            raise ValueError(
+                f'Continuous batching is not supported for {method_name}'
+            )
+          batch_generate_method_key = MethodKey(
+              MethodName.BATCHED_LM_GENERATE, method_name, service_id, model_key
+          )
+          self._batcher.register_method(
+              model,
+              batch_generate_method_key,
+              method.batch_size,
+              preprocess_fn=functools.partial(
+                  preprocess_rpc_tasks, prefill=True
+              ),
+              # Each batch has `batch_size` requests and we should have at least
+              # `num_cache_slots` * 2 live requests
+              max_live_batches=method.num_cache_slots * 2 // method.batch_size,
+              batching_wait_secs=method.batching_wait_secs,
+          )
+
+    model = self._loaded_models.load(
         model_key,
         model_path,
         checkpoint_path,
@@ -1375,6 +1656,22 @@ class ModelServicesRunner:
         register_methods,
     )
 
+    for method_name, method_obj in model.methods.items():
+      if method_obj.continuous_batching:
+        state = ContinuousBatchingState(
+            method_obj,
+            model_key=model_key,
+            model_method=method_name,
+            service_id=method_obj.service_id(),
+            num_cache_slots=method_obj.num_cache_slots,
+            max_decode_step=method_obj.max_decode_steps,
+            prefill_fn=self._run_prefill_insert_loop,
+            generate_fn=self._run_generation_loop,
+        )
+        self._continuous_batching_state[(model_key, method_name)] = state
+        state.prefill_thread.start()
+        state.generate_thread.start()
+
   def _save_model(self, model_key: str, checkpoint_path: str):
     """Saves a model checkpoint."""
     if not self._loaded_models.contains(model_key):
@@ -1383,7 +1680,7 @@ class ModelServicesRunner:
     self._loaded_models.get_model(model_key).save(checkpoint_path)
 
   def _enqueue_terminate(self):
-    self._batcher.add_item(key=MethodKey(_TERMINATE_METHOD_KEY))
+    self._batcher.add_item(key=MethodKey(MethodName.TERMINATE))
 
   def _inform_secondary_hosts(self, *msgs: str, skip_host_sync=True) -> None:
     self._multihost_sync.send(self._encode_message(*msgs), skip_host_sync)
@@ -1414,7 +1711,7 @@ class ModelServicesRunner:
         if not pre_process_failure:
           logging.info('Processing final results.')
         try:
-          method_obj = model.method(batch.method.name)
+          method_obj = model.method(batch.method.model_method)
           utils.traceprint_all(
               batch.rpc_tasks, f'in _postprocess_async: {batch.method}'
           )
@@ -1444,9 +1741,14 @@ class ModelServicesRunner:
             utils.traceprint_all(
                 batch.rpc_tasks, f'After post_processing: {batch.method}'
             )
+            if len(outputs) != len(batch.rpc_tasks):
+              raise ValueError(
+                  f'post_processing returned {outputs=}, expected'
+                  f' {len(batch.rpc_tasks)} items.'
+              )
             for out, task in zip(outputs, batch.rpc_tasks):
               self._model_services[batch.method.service_id].FillRPCResponse(
-                  batch.method.name, out, task.response
+                  batch.method.model_method, out, task.response
               )
               task.done(utils.ok(), query_cost=tpu_ms)
               done_rpcs += 1
@@ -1455,15 +1757,16 @@ class ModelServicesRunner:
             self._log_exception(
                 'Postprocessing error. model_key: %s, method: %s, error: %s',
                 batch.method.model_key,
-                batch.method.name,
+                batch.method.model_method,
                 e,
             )
             error_msg = f'Postprocessing error: {e}\n{traceback.format_exc()}'
             for task in batch.rpc_tasks[done_rpcs:]:
               task.done(utils.internal_error(error_msg))
 
-    self._pool.run(_postprocess)
+    self._postprocess_pool.run(_postprocess)
 
+  # TODO(changlan): Merge with _postprocess_async
   def _postprocess_stream_async(
       self,
       model: servable_model.ServableModel,
@@ -1478,7 +1781,7 @@ class ModelServicesRunner:
       stream_state = None
       while not done:
         b = len(batch.rpc_tasks)
-        method_obj = model.method(batch.method.name)
+        method_obj = model.method(batch.method.model_method)
         host_tensors = method_obj.dequeue_stream_output()
         if host_tensors is None:
           # Done with streaming.
@@ -1497,11 +1800,18 @@ class ModelServicesRunner:
                 host_tensors, stream_state
             )
             query_cost = (time.time() - start_ts) / len(batch.rpc_tasks)
+            if host_tensors is not None and len(outputs) != len(
+                batch.rpc_tasks
+            ):
+              raise ValueError(
+                  f'post_processing_stream returned {outputs=}, expected'
+                  f' {len(batch.rpc_tasks)} items.'
+              )
             for out, task in zip(outputs, batch.rpc_tasks):
               # Use a new response each time.
               resp = copy.deepcopy(task.response)
               self._model_services[batch.method.service_id].FillRPCResponse(
-                  batch.method.name, out, resp
+                  batch.method.model_method, out, resp
               )
               task.done(utils.ok(), resp=resp, query_cost=query_cost)
               done_rpcs += 1
@@ -1509,7 +1819,7 @@ class ModelServicesRunner:
             self._log_exception(
                 'Postprocessing error. model_key: %s, method: %s, error: %s',
                 batch.method.model_key,
-                batch.method.name,
+                batch.method.model_method,
                 e,
             )
             error_msg = f'Postprocessing error: {e}\n{traceback.format_exc()}'
@@ -1525,207 +1835,491 @@ class ModelServicesRunner:
     """Main loop for processing batches."""
     while True:
       batch = self._batcher.get_batch()
-      if batch.method.name == _LOAD_METHOD_KEY:
-        with batch:
-          assert len(batch.rpc_tasks) == 1
-          task = batch.rpc_tasks[0]
-          request = typing.cast(modelet_pb2.LoadRequest, task.request)
-          assert batch.method.model_key is None
-          model_key = request.model_key
-          assert model_key
+      match batch.method.name:
+        case MethodName.LOAD:
+          with batch:
+            assert len(batch.rpc_tasks) == 1
+            task = batch.rpc_tasks[0]
+            request = typing.cast(modelet_pb2.LoadRequest, task.request)
+            assert batch.method.model_key is None
+            model_key = request.model_key
+            assert model_key
+            try:
+              # Generate a seed for the model and pass to secondary hosts.
+              prng_seed = self._generate_rng_seed()
+              self._inform_secondary_hosts(
+                  batch.method.name,
+                  model_key,
+                  request.model_path,
+                  request.checkpoint_path,
+                  json.dumps({k: v for k, v in request.overrides.items()}),
+                  str(prng_seed),
+              )
+              self._load_model(
+                  model_key,
+                  request.model_path,
+                  request.checkpoint_path,
+                  dict(request.acls.items),
+                  dict(request.overrides),
+                  prng_seed,
+              )
+              task.done(utils.ok())
+            except ValueError as e:
+              self._log_exception(
+                  (
+                      'Invalid load request. model_key: %s, model_path: %s,'
+                      ' error: %s'
+                  ),
+                  model_key,
+                  request.model_path,
+                  e,
+              )
+              task.done(utils.invalid_arg(f'{e}'))
+            except Exception as e:  # pylint: disable=broad-except
+              self._log_exception(
+                  (
+                      'Internal error during loading. model_key: %s,'
+                      ' model_path: %s, error: %s'
+                  ),
+                  model_key,
+                  request.model_path,
+                  e,
+              )
+              task.done(utils.internal_error(f'Loading error: {e}'))
+        case MethodName.UNLOAD:
+          with batch:
+            assert len(batch.rpc_tasks) == 1
+            task = batch.rpc_tasks[0]
+            request = typing.cast(modelet_pb2.UnloadRequest, task.request)
+            assert batch.method.model_key is None
+            model_key = request.model_key
+            try:
+              if not model_key:
+                raise ValueError('model_key is not specified.')
+              self._inform_secondary_hosts(batch.method.name, model_key)
+              self._loaded_models.unload(model_key)
+              task.done(utils.ok())
+            except ValueError as e:
+              logging.exception(
+                  'Invalid unload request. model_key %s, error: %s',
+                  model_key,
+                  e,
+              )
+              task.done(utils.invalid_arg(f'Unloading error: {e}'))
+            except Exception as e:  # pylint: disable=broad-except
+              self._log_exception(
+                  'Internal error during unloading. model_key: %s, error: %s',
+                  model_key,
+                  e,
+              )
+              task.done(utils.internal_error(f'Unloading error: {e}'))
+        case MethodName.EXPORT:
+          with batch:
+            assert len(batch.rpc_tasks) == 1
+            task = batch.rpc_tasks[0]
+            request = typing.cast(modelet_pb2.ExportRequest, task.request)
+            exporter = Exporter(self)
+            try:
+              export_args = exporter.parse_export_request(request)
+              # Starts a multi-host export job. Any exception must be from
+              # low-level software/hardware stack and or secondary workers not
+              # being informed. Thus we crash the server to avoid hanging if
+              # there is any exception.
+              try:
+                self._inform_secondary_hosts(batch.method.name, *export_args)
+                exporter.export_model(*export_args)
+              except Exception as e:  # pylint: disable=broad-except
+                self._worker_thread_exception = e
+                break
+              exporter.finalize_export(*export_args)
+              task.done(utils.ok())
+            except Exception as e:  # pylint: disable=broad-except
+              self._log_exception(
+                  (
+                      '%s during Exporting. model_key: %s, method_names %s,'
+                      ' export_path: %s, error: %s'
+                  ),
+                  type(e),
+                  request.model_key,
+                  request.method_names,
+                  request.export_path,
+                  e,
+              )
+              task.done(exporter.export_error_to_status(e))
+        case MethodName.SAVE:
+          with batch:
+            assert len(batch.rpc_tasks) == 1
+            task = batch.rpc_tasks[0]
+            request = typing.cast(modelet_pb2.SaveRequest, task.request)
+            try:
+              self._inform_secondary_hosts(
+                  batch.method.name, request.model_key, request.checkpoint_path
+              )
+              self._save_model(request.model_key, request.checkpoint_path)
+              task.done(utils.ok())
+            except ValueError as e:
+              self._log_exception(
+                  'Invalid save request. model_key %s, error: %s, ',
+                  request.model_key,
+                  e,
+              )
+              task.done(utils.invalid_arg(f'Save checkpoint error: {e}'))
+            except Exception as e:  # pylint: disable=broad-except
+              self._log_exception(
+                  (
+                      'Internal error during Saving checkpoint. model_key: %s, '
+                      'error: %s'
+                  ),
+                  request.model_key,
+                  e,
+              )
+              task.done(utils.internal_error(f'Saving checkpoint error: {e}'))
+        case MethodName.TERMINATE:
+          with batch:
+            assert batch.method.model_key is None
+            self._inform_secondary_hosts(batch.method.name)
+            break
+        case MethodName.KEEP_DEVICES_WARM:
+          with batch:
+            self._inform_secondary_hosts(batch.method.name)
+        case MethodName.MODEL:
+          # Model methods hosts are simply invoking a device program with
+          # pre-processed inputs, so we do not expect any known exception here.
+          # An exception must be from low-level software/hardware stack and we
+          # crash the job.
           try:
-            # Generate a seed for the model and pass to secondary hosts.
-            prng_seed = self._generate_rng_seed()
             self._inform_secondary_hosts(
                 batch.method.name,
-                model_key,
-                request.model_path,
-                request.checkpoint_path,
-                json.dumps({k: v for k, v in request.overrides.items()}),
-                str(prng_seed),
+                batch.method.model_key,
+                batch.method.model_method,
+                str(batch.unpadded_shape),
+                str(batch.padded_shape),
+                skip_host_sync=batch.skip_host_sync,
             )
-            self._load_model(
-                model_key,
-                request.model_path,
-                request.checkpoint_path,
-                dict(request.acls.items),
-                dict(request.overrides),
-                prng_seed,
-            )
-            task.done(utils.ok())
-          except ValueError as e:
-            self._log_exception(
-                (
-                    'Invalid load request. model_key: %s, model_path: %s,'
-                    ' error: %s'
-                ),
-                model_key,
-                request.model_path,
-                e,
-            )
-            task.done(utils.invalid_arg(f'{e}'))
-          except Exception as e:  # pylint: disable=broad-except
-            self._log_exception(
-                (
-                    'Internal error during loading. model_key: %s, model_path:'
-                    ' %s, error: %s'
-                ),
-                model_key,
-                request.model_path,
-                e,
-            )
-            task.done(utils.internal_error(f'Loading error: {e}'))
-      elif batch.method.name == _UNLOAD_METHOD_KEY:
-        with batch:
-          assert len(batch.rpc_tasks) == 1
-          task = batch.rpc_tasks[0]
-          request = typing.cast(modelet_pb2.UnloadRequest, task.request)
-          assert batch.method.model_key is None
-          model_key = request.model_key
-          try:
-            if not model_key:
-              raise ValueError('model_key is not specified.')
-            self._inform_secondary_hosts(batch.method.name, model_key)
-            self._loaded_models.unload(model_key)
-            task.done(utils.ok())
-          except ValueError as e:
-            logging.exception(
-                'Invalid unload request. model_key %s, error: %s', model_key, e
-            )
-            task.done(utils.invalid_arg(f'Unloading error: {e}'))
-          except Exception as e:  # pylint: disable=broad-except
-            self._log_exception(
-                'Internal error during unloading. model_key: %s, error: %s',
-                model_key,
-                e,
-            )
-            task.done(utils.internal_error(f'Unloading error: {e}'))
-      elif batch.method.name == _EXPORT_METHOD_KEY:
-        with batch:
-          assert len(batch.rpc_tasks) == 1
-          task = batch.rpc_tasks[0]
-          request = typing.cast(modelet_pb2.ExportRequest, task.request)
-          exporter = Exporter(self)
-          try:
-            export_args = exporter.parse_export_request(request)
-            # Starts a multi-host export job. Any exception must be from
-            # low-level software/hardware stack and or secondary workers not
-            # being informed. Thus we crash the server to avoid hanging if
-            # there is any exception.
-            try:
-              self._inform_secondary_hosts(batch.method.name, *export_args)
-              exporter.export_model(*export_args)
-            except Exception as e:  # pylint: disable=broad-except
-              self._worker_thread_exception = e
-              break
-            exporter.finalize_export(*export_args)
-            task.done(utils.ok())
-          except Exception as e:  # pylint: disable=broad-except
-            self._log_exception(
-                (
-                    '%s during Exporting. model_key: %s, method_names %s,'
-                    ' export_path: %s, error: %s'
-                ),
-                type(e),
-                request.model_key,
-                request.method_names,
-                request.export_path,
-                e,
-            )
-            task.done(exporter.export_error_to_status(e))
-      elif batch.method.name == _SAVE_MODEL_KEY:
-        with batch:
-          assert len(batch.rpc_tasks) == 1
-          task = batch.rpc_tasks[0]
-          request = typing.cast(modelet_pb2.SaveRequest, task.request)
-          try:
-            self._inform_secondary_hosts(
-                batch.method.name, request.model_key, request.checkpoint_path
-            )
-            self._save_model(request.model_key, request.checkpoint_path)
-            task.done(utils.ok())
-          except ValueError as e:
-            self._log_exception(
-                'Invalid save request. model_key %s, error: %s, ',
-                request.model_key,
-                e,
-            )
-            task.done(utils.invalid_arg(f'Save checkpoint error: {e}'))
-          except Exception as e:  # pylint: disable=broad-except
-            self._log_exception(
-                (
-                    'Internal error during Saving checkpoint. model_key: %s, '
-                    'error: %s'
-                ),
-                request.model_key,
-                e,
-            )
-            task.done(utils.internal_error(f'Saving checkpoint error: {e}'))
-      elif batch.method.name == _TERMINATE_METHOD_KEY:
-        with batch:
-          assert batch.method.model_key is None
-          self._inform_secondary_hosts(batch.method.name)
-          break
-      elif batch.method.name == _KEEP_DEVICES_WARM_METHOD_KEY:
-        with batch:
-          self._inform_secondary_hosts(batch.method.name)
-      else:
-        # Model methods hosts are simply invoking a device program with
-        # pre-processed inputs, so we do not expect any known exception here.
-        # An exception must be from low-level software/hardware stack and we
-        # crash the job.
-        try:
-          self._inform_secondary_hosts(
-              batch.method.name,
-              batch.method.model_key,
-              str(batch.unpadded_shape),
-              skip_host_sync=batch.skip_host_sync,
-          )
-          model = self._loaded_models.get_model(batch.method.model_key)
-          batch.wait_for_ready()
-          utils.traceprint_all(
-              batch.rpc_tasks, f'Before device compute {batch.method}'
-          )
-          method_obj = model.method(batch.method.name)
+            model = self._loaded_models.get_model(batch.method.model_key)
+            batch.wait_for_ready()
 
-          streaming_done = None
-          if batch.input_tensors is None:
-            # Failed preprosessing. Since we have already informed secondary
-            # hosts, we need to compute on tensors.
-            if self._spmd_backend.spmd_host_count() > 1:
-              # JAX dispatches device_compute synchronously to XLA:GPU. Hence
-              # _postprocess_stream_async must start before device_compute,
-              # otherwise device_compute may block the consumption of streaming
-              # queue until it finishes.
-              if method_obj.streamable:
-                streaming_done = utils.Notification()
-                self._postprocess_stream_async(model, batch, streaming_done)
-              result = method_obj.device_compute_with_dummy_data(
-                  batch.unpadded_shape
-              )
+            method_obj = model.method(batch.method.model_method)
+            enable_token_streaming = method_obj.streamable_output
+            streaming_done = (
+                utils.Notification() if enable_token_streaming else None
+            )
+            if batch.input_tensors is None:
+              # Failed preprosessing. Since we have already informed secondary
+              # hosts, we need to compute on tensors.
+              if self._spmd_backend.spmd_host_count() > 1:
+                # JAX dispatches device_compute synchronously to XLA:GPU. Hence
+                # _postprocess_stream_async must start before device_compute,
+                # otherwise device_compute may block the consumption of
+                # streaming queue until it finishes.
+                if enable_token_streaming:
+                  self._postprocess_stream_async(model, batch, streaming_done)
+                assert batch.unpadded_shape is not None
+                assert batch.padded_shape is None
+                padded_shape = method_obj.get_padded_input_shape(
+                    batch.unpadded_shape
+                )
+                result = method_obj.device_compute_with_dummy_data(padded_shape)
+              else:
+                # Skip device compute if there is no secondary host.
+                result = None
             else:
-              result = None
-          else:
-            if method_obj.streamable:
-              streaming_done = utils.Notification()
-              self._postprocess_stream_async(model, batch, streaming_done)
-            result = method_obj.device_compute(
-                input_batch=batch.input_tensors,
-                unpadded_shape=batch.unpadded_shape,
+              # Successful pre-processing. Compute on device using the padded
+              # shape picked by pre-processing.
+              if enable_token_streaming:
+                self._postprocess_stream_async(model, batch, streaming_done)
+              assert batch.unpadded_shape is None
+              assert batch.padded_shape is not None
+              result = method_obj.device_compute(
+                  input_batch=batch.input_tensors,
+                  padded_shape=batch.padded_shape,
+              )
+            if result is None:
+              batch.finish()
+            else:
+              self._postprocess_async(model, batch, result, streaming_done)
+              del result
+          except Exception as e:  # pylint: disable=broad-except
+            self._worker_thread_exception = e
+            batch.finish()
+            break
+        case MethodName.BATCHED_LM_GENERATE:
+          try:
+            batch.wait_for_ready()
+
+            key = (batch.method.model_key, batch.method.model_method)
+            assert key in self._continuous_batching_state, (
+                f'Model method {key} not found in continuous batching state.'
+                f' Available keys: {self._continuous_batching_state.keys()}'
             )
-          utils.traceprint_all(
-              batch.rpc_tasks, f'After device compute {batch.method}'
+
+            state = self._continuous_batching_state[key]
+
+            state.prefill_queue.put(
+                PrefillRequest(
+                    preprocessed_inputs=batch.input_tensors,
+                    rpc_tasks=batch.rpc_tasks,
+                    enqueue_time=time.time(),
+                )
+            )
+            batch.finish()
+          except Exception as e:  # pylint: disable=broad-except
+            self._worker_thread_exception = e
+            batch.finish()
+            break
+        case _:
+          batch.finish()
+          self._log_exception('Unknown method: %s', batch.method.name)
+
+  def _run_prefill_insert_loop(
+      self,
+      state: ContinuousBatchingState,
+  ):
+    """Host loop for running prefills on the primary host."""
+    model_key = state.model_key
+    model_method = state.model_method
+    logging.info(
+        'Running prefill insert loop for model %s method %s',
+        model_key,
+        model_method,
+    )
+    method_obj = state.method
+    while True:
+      # Block if there is no prefill requests.
+      request = state.prefill_queue.get()
+      n_tasks = len(request.rpc_tasks)
+      # Block if there is no available cache slot.
+      slots = []
+      for i in range(n_tasks):
+        slots.append(state.available_slots.get())
+        # Wake up the generation loop when no available slot is left
+        if state.available_slots.empty() and i < n_tasks - 1:
+          state.pending_insert = False
+          with state.generate_cv:
+            state.generate_cv.notify()
+      slots = tuple(slots)
+
+      prefill_dequeue_time = time.time()
+
+      # Take unused slots.
+      logging.info('Taking slots %s', slots)
+
+      # Atomic mutation. Safe to be outside of generate_cv guard.
+      state.pending_insert = True
+      with state.generate_cv:
+        with self._device_compute_mutex:
+          self._inform_secondary_hosts(
+              MethodName.PREFILL_INSERT,
+              state.model_key,
+              state.model_method,
+              ','.join([str(s) for s in slots]),
+              skip_host_sync=True,
           )
 
-          if result is None:
-            batch.finish()
-          else:
-            self._postprocess_async(model, batch, result, streaming_done)
-            del result
-        except Exception as e:  # pylint: disable=broad-except
-          self._worker_thread_exception = e
-          batch.finish()
-          break
+          assert request.preprocessed_inputs is not None
+          assert request.rpc_tasks is not None
+
+          scores, tokens, prefix_cache = method_obj.prefill(
+              inputs=request.preprocessed_inputs,
+          )
+          state.update_stats(
+              prefill_wait_time=prefill_dequeue_time - request.enqueue_time,
+              insert_wait_time=time.time() - prefill_dequeue_time,
+          )
+
+          method_obj.insert(prefix_cache, slots)
+
+        host_tokens = np.array(tokens.addressable_data(0))
+        host_scores = np.array(scores.addressable_data(0))
+        state.decoded_tokens[slots, 0] = host_tokens[:n_tasks]
+        state.scores[slots, ...] = host_scores[:n_tasks]
+
+        self._run_post_prefill_async(
+            state,
+            slots,
+            copy.deepcopy(host_tokens),
+            copy.deepcopy(host_scores),
+            request.rpc_tasks,
+        )
+        state.steps[slots, ...] = 1
+
+        # Must set slots_in_use in the end.
+        state.slots_in_use[slots, ...] = 1
+
+        # Don't wake up the generate thread if there are more pending requests
+        # and empty slots.
+        if state.prefill_queue.empty() or state.available_slots.empty():
+          state.pending_insert = False
+          state.generate_cv.notify()
+
+  # pylint: disable=unused-argument
+  def _run_post_prefill_async(self, state, slots, tokens, scores, request_rpcs):
+    """Runs the post-prefill processing on a dedicated thread."""
+
+    n_tasks = len(slots)
+    assert n_tasks == len(request_rpcs)
+
+    def _postprocess():
+      for i, slot in enumerate(slots):
+        state.rpc_tasks[slot] = request_rpcs[i]
+
+      if state.method.streamable_output:
+        nonlocal tokens
+        nonlocal scores
+
+        assert len(tokens.shape) == 1, tokens.shape
+        assert len(scores.shape) == 1, scores.shape
+        assert tokens.shape[0] == scores.shape[0], (
+            scores.shape,
+            tokens.shape,
+        )
+
+        scores = np.expand_dims(scores, axis=1)
+        tokens = np.expand_dims(tokens, axis=1)
+        output_strings = state.method.detokenize(tokens)
+
+        for i, slot in enumerate(slots):
+          resp = copy.deepcopy(state.rpc_tasks[slot].response)
+          outputs = output_strings[i], scores[i]
+          self._model_services[state.service_id].FillRPCResponse(
+              state.model_method, outputs, resp
+          )
+          try:
+            state.rpc_tasks[slot].done(utils.ok(), resp=resp)
+          except Exception as e:  # pylint: disable=broad-except
+            self._log_exception(
+                'Error occurred: %s, error: %s', state.model_key, e
+            )
+
+    state.post_process_pool.run(_postprocess)
+
+  def _run_generation_loop(
+      self,
+      state: ContinuousBatchingState,
+  ):
+    """Host loop for running continuous generation on the primary host."""
+    model_key = state.model_key
+    model_method = state.model_method
+    logging.info(
+        'Running generation loop for model %s method %s',
+        model_key,
+        model_method,
+    )
+    method_obj = state.method
+
+    prev_result = None
+    prev_mask = None
+    while True:
+      with state.generate_cv:
+        while not state.slots_in_use.any() or state.pending_insert:
+          # Release the lock and wait.
+          state.generate_cv.wait()
+
+        # Perform generation.
+        with self._device_compute_mutex:
+          start_ts = time.time()
+          self._inform_secondary_hosts(
+              MethodName.GENERATE,
+              state.model_key,
+              state.model_method,
+              skip_host_sync=True,
+          )
+          current_result = method_obj.generate()
+          current_mask = state.slots_in_use.copy()
+
+        # Copy result to host
+        if prev_result is not None:
+          assert prev_mask is not None
+          scores, tokens, done = method_obj.output_to_host(
+              prev_result, unpadded_batch_size=state.num_cache_slots
+          )
+
+          state.decoded_tokens[
+              np.arange(state.num_cache_slots), state.steps
+          ] = tokens
+
+          state.scores += scores * prev_mask
+          state.steps += prev_mask
+          done = done * prev_mask
+
+          done = np.logical_or(done, state.steps >= state.max_decode_steps)
+
+          if np.any(done):
+            # Detokenize and send RPC in another thread for done slots
+            self._run_post_generate_async(
+                state,
+                copy.deepcopy(state.decoded_tokens[done]),
+                copy.deepcopy(state.scores[done]),
+                done,
+            )
+            # Reset the cache slot state.
+            state.decoded_tokens[done] = 0
+            state.scores[done] = 0.0
+            state.steps[done] = 0
+            state.slots_in_use[done] = 0
+
+            # Discard stale run-ahead results
+            current_mask[done] = 0
+
+            # Release the slots.
+            for slot in np.flatnonzero(done):
+              logging.info('Releasing slot %d.', slot)
+              state.available_slots.put(slot)
+
+        prev_result = current_result
+        prev_mask = current_mask
+
+        state.generate_step_time.add(time.time() - start_ts)
+
+  def _run_post_generate_async(
+      self, state: ContinuousBatchingState, sequences, scores, done
+  ):
+    """Runs the post-generate processing on a dedicated thread."""
+    if state.method.streamable_output:
+      sequences = sequences[:, 1:]
+
+    def _postprocess():
+      # If any of the sequences in the batch is done, return the response
+      # and reset the cache slot.
+      output_strings = state.method.detokenize(sequences)
+
+      for idx, slot in enumerate(np.flatnonzero(done)):
+        outputs = [output_strings[idx]], [scores[idx]]
+        if state.method.streamable_output:
+          # send response back to generate_stream
+          resp = copy.deepcopy(state.rpc_tasks[slot].response)
+          self._model_services[state.service_id].FillRPCResponse(
+              state.model_method, outputs, resp
+          )
+          try:
+            state.rpc_tasks[slot].done(utils.ok(), resp=resp)
+          except Exception as e:  # pylint: disable=broad-except
+            self._log_exception(
+                'Error occurred: %s, error: %s', state.model_key, e
+            )
+
+          # send response done back to generate_stream
+          try:
+            state.rpc_tasks[slot].done(utils.ok())
+          except Exception as e:  # pylint: disable=broad-except
+            self._log_exception(
+                'Error occurred: %s, error: %s', state.model_key, e
+            )
+          state.rpc_tasks[slot] = None
+        else:
+          # send response back to generate
+          self._model_services[state.service_id].FillRPCResponse(
+              state.model_method, outputs, state.rpc_tasks[slot].response
+          )
+          try:
+            state.rpc_tasks[slot].done(utils.ok())
+          except Exception as e:  # pylint: disable=broad-except
+            self._log_exception(
+                'Error occurred: %s, error: %s', state.model_key, e
+            )
+          state.rpc_tasks[slot] = None
+
+    state.post_process_pool.run(_postprocess)
 
   def _run_secondary_worker_loop(self):
     """Runs the processing loop in secondary hosts in a multi-host setup."""
@@ -1733,77 +2327,133 @@ class ModelServicesRunner:
       sync_output = self._multihost_sync.receive()
       msgs = self._decode_message(sync_output)
       method = msgs.pop(0)
-      if method == _LOAD_METHOD_KEY:
-        model_key, model_path, ckpt_path, overrides_json, prng_seed = msgs
-        overrides = json.loads(overrides_json)
-        logging.info('Received load: %s', model_key)
-        try:
-          prng_seed = int(prng_seed)
-          if not self._loaded_models.contains(model_key):
-            self._loaded_models.load(
-                model_key,
-                model_path,
-                ckpt_path,
-                {},  # Empty ACLs because only the primary worker needs it.
-                overrides,
-                prng_seed,
+      match method:
+        case MethodName.LOAD:
+          model_key, model_path, ckpt_path, overrides_json, prng_seed = msgs
+          overrides = json.loads(overrides_json)
+          logging.info('Received load: %s', model_key)
+          try:
+            prng_seed = int(prng_seed)
+            if not self._loaded_models.contains(model_key):
+              self._loaded_models.load(
+                  model_key,
+                  model_path,
+                  ckpt_path,
+                  {},  # Empty ACLs because only the primary worker needs it.
+                  overrides,
+                  prng_seed,
+              )
+          except Exception as e:  # pylint: disable=broad-except
+            self._log_exception(
+                'Error occurred during loading: %s, error: %s', model_key, e
             )
-        except Exception as e:  # pylint: disable=broad-except
-          self._log_exception(
-              'Error occurred during loading: %s, error: %s', model_key, e
-          )
-      elif method == _UNLOAD_METHOD_KEY:
-        model_key = msgs[0]
-        logging.info('Received unload: %s', model_key)
-        try:
-          self._loaded_models.unload(model_key)
-        except Exception as e:  # pylint: disable=broad-except
-          self._log_exception(
-              'Error occurred during unloading: %s, error: %s', model_key, e
-          )
-      elif method == _TERMINATE_METHOD_KEY:
-        logging.info('Received terminate')
-        break
-      elif method == _KEEP_DEVICES_WARM_METHOD_KEY:
-        continue
-      elif method == _SAVE_MODEL_KEY:
-        model_key, ckpt_path = msgs
-        logging.info('Received save: %s', model_key)
-        try:
-          self._save_model(model_key, ckpt_path)
-        except Exception as e:  # pylint: disable=broad-except
-          self._log_exception(
-              'Error occurred during save: %s, error: %s', model_key, e
-          )
-      elif method == _EXPORT_METHOD_KEY:
-        # Starts a multi-host export job. Any exception must be from low-level
-        # software/hardware stack. Thus we crash the server to avoid hanging if
-        # there is any exception.
-        exporter = Exporter(self)
-        try:
-          exporter.export_model(*msgs)
-        except Exception as e:  # pylint: disable=broad-except
-          self._worker_thread_exception = e
+        case MethodName.UNLOAD:
+          model_key = msgs[0]
+          logging.info('Received unload: %s', model_key)
+          try:
+            self._loaded_models.unload(model_key)
+          except Exception as e:  # pylint: disable=broad-except
+            self._log_exception(
+                'Error occurred during unloading: %s, error: %s', model_key, e
+            )
+        case MethodName.TERMINATE:
+          logging.info('Received terminate')
           break
-      else:
-        # Model methods at secondary hosts are simply invoking a device program
-        # with pre-defined dummy inputs, so we do not expect any known exception
-        # here. An exception must be from low-level software/hardware stack and
-        # we crash the job.
-        try:
-          model_key = msgs.pop(0)
-          unpadded_shape_str = msgs.pop(0)
-          logging.info(
-              'Received model_key %s method %s, unpadded_shape %s',
-              model_key,
-              method,
-              unpadded_shape_str,
-          )
-          method_obj = self._loaded_models.get_model(model_key).method(method)
-          unpadded_shape = method_obj.deserialize_input_shape(
-              unpadded_shape_str
-          )
-          method_obj.device_compute_with_dummy_data(unpadded_shape)
-        except Exception as e:  # pylint: disable=broad-except
-          self._worker_thread_exception = e
-          break
+        case MethodName.KEEP_DEVICES_WARM:
+          logging.info('Received keep devices warm')
+          continue
+        case MethodName.SAVE:
+          model_key, ckpt_path = msgs
+          logging.info('Received save: %s', model_key)
+          try:
+            self._save_model(model_key, ckpt_path)
+          except Exception as e:  # pylint: disable=broad-except
+            self._log_exception(
+                'Error occurred during save: %s, error: %s', model_key, e
+            )
+        case MethodName.EXPORT:
+          # Starts a multi-host export job. Any exception must be from low-level
+          # software/hardware stack. Thus we crash the server to avoid hanging
+          # if there is any exception.
+          exporter = Exporter(self)
+          try:
+            exporter.export_model(*msgs)
+          except Exception as e:  # pylint: disable=broad-except
+            self._worker_thread_exception = e
+            break
+        case MethodName.MODEL:
+          # Model methods at secondary hosts are simply invoking a device
+          # program with pre-defined dummy inputs, so we do not expect any known
+          # exception here. An exception must be from low-level
+          # software/hardware stack and we crash the job.
+          try:
+            model_key, model_method, unpadded_shape_str, padded_shape_str = msgs
+            logging.info(
+                'Received model_key %s, method %s, unpadded_shape %s,'
+                ' padded_shape %s',
+                model_key,
+                model_method,
+                unpadded_shape_str,
+                padded_shape_str,
+            )
+            method_obj = self._loaded_models.get_model(model_key).method(
+                model_method
+            )
+            if unpadded_shape_str == 'None':
+              unpadded_shape = None
+            else:
+              unpadded_shape = method_obj.deserialize_input_shape(
+                  unpadded_shape_str
+              )
+            if padded_shape_str == 'None':
+              padded_shape = None
+            else:
+              padded_shape = method_obj.deserialize_input_shape(
+                  padded_shape_str
+              )
+            if unpadded_shape is None:
+              # Successful pre-processing.
+              assert padded_shape is not None
+            else:
+              # Presync or failed-preprocessing.
+              assert padded_shape is None
+              padded_shape = method_obj.get_padded_input_shape(unpadded_shape)
+            method_obj.device_compute_with_dummy_data(padded_shape)
+          except Exception as e:  # pylint: disable=broad-except
+            self._worker_thread_exception = e
+            break
+        case MethodName.PREFILL_INSERT:
+          try:
+            model_key, model_method, slots = msgs
+            logging.info(
+                'Received PREFILL_INSERT model_key %s method %s slot %s',
+                model_key,
+                model_method,
+                slots,
+            )
+            slots = [int(s) for s in slots.split(',')]
+            method_obj = self._loaded_models.get_model(model_key).method(
+                model_method
+            )
+            _, _, state = method_obj.prefill_with_dummy()
+            method_obj.insert(state, slots)
+          except Exception as e:  # pylint: disable=broad-except
+            self._worker_thread_exception = e
+            break
+        case MethodName.GENERATE:
+          try:
+            model_key, model_method = msgs
+            logging.info(
+                'Received GENERATE model_key %s method %s',
+                model_key,
+                model_method,
+            )
+            method_obj = self._loaded_models.get_model(model_key).method(
+                model_method
+            )
+            method_obj.generate()
+          except Exception as e:  # pylint: disable=broad-except
+            self._worker_thread_exception = e
+            break
+        case _:
+          self._log_exception('Unknown method: %s, msgs: %s', method, msgs)

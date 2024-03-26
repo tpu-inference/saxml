@@ -16,7 +16,9 @@
 import os
 from typing import List, cast
 
+import jax
 from jax import numpy as jnp
+import numpy as np
 from paxml import base_experiment
 from paxml import tasks_lib
 from paxml.tasks.lm.params import lm_cloud
@@ -29,9 +31,11 @@ from praxis.layers import activations
 from praxis.layers import multi_query_attention
 from saxml.server import servable_model_registry
 from saxml.server.pax import quantization
-from saxml.server.pax.lm.layers import LLaMARotaryEmbedding
-from saxml.server.pax.lm.layers import ParallelTransformer
+from saxml.server.pax.lm import layers as sax_layers
 from saxml.server.pax.lm.params import template
+
+LLaMARotaryEmbedding = sax_layers.LLaMARotaryEmbedding
+ParallelTransformer = sax_layers.ParallelTransformer
 
 
 @template.make_servable()
@@ -42,7 +46,7 @@ class BaseLLaMA(base_experiment.BaseExperiment):
   SOS_ID = 1
   EOS_ID = 2
 
-  # architecture related
+  # Architecture related params.
   NUM_LAYERS = 32
   VOCAB_SIZE = 32000
   DIMS_PER_HEAD = 128
@@ -52,6 +56,7 @@ class BaseLLaMA(base_experiment.BaseExperiment):
   FPROP_DTYPE = jnp.bfloat16
   MODEL_DTYPE = jnp.bfloat16
   USE_MQA = False
+  GPU_FLASH_DECODING = False
 
   ACTIVATION_CLS = activations.SiLU
   USE_GATED_ACTIVATION = True
@@ -61,9 +66,13 @@ class BaseLLaMA(base_experiment.BaseExperiment):
   ICI_MESH_SHAPE = [1, 1, 1]
   DCN_MESH_SHAPE = None
   DECODE_MESH_TRANSPOSE = None
+  USE_BATCH_SHARDING = False
+  QUANTIZE_KV = False
 
   BATCH_SIZE = 1
   NUM_SAMPLES = 1
+  ATTEN_NUM_SEQ_SPLITS = 1
+  GENERATE_ONLY = True
   ENABLE_GENERATE_STREAM = True
   STREAM_INTERVAL_STEPS = 16
   FPROP_FOR_PREFIX = True
@@ -76,6 +85,15 @@ class BaseLLaMA(base_experiment.BaseExperiment):
       'per_example_top_k': 200,
       'per_example_top_p': 0.95,
   }
+  EXTRA_INPUTS_DTYPES = {
+      'temperature': np.float32,
+      'per_example_max_decode_steps': np.int32,
+      'per_example_top_k': np.int32,
+      'per_example_top_p': np.float32,
+  }
+
+  # Disable continuous batching by default.
+  NUM_CACHE_SLOTS = 0
 
   def datasets(self) -> List[pax_fiddle.Config[base_input.BaseInput]]:
     return []
@@ -83,7 +101,12 @@ class BaseLLaMA(base_experiment.BaseExperiment):
   def task(self) -> pax_fiddle.Config[tasks_lib.SingleTask]:
     """Returns the task parameters."""
     task_p = pax_fiddle.Config(tasks_lib.SingleTask, name='xformer_task')
-    task_p.model = pax_fiddle.Config(layers.LanguageModel, name='xformer_lm')
+    if self.NUM_CACHE_SLOTS > 0:
+      task_p.model = pax_fiddle.Config(
+          layers.LanguageModelContinuousBatching, name='xformer_lm'
+      )
+    else:
+      task_p.model = pax_fiddle.Config(layers.LanguageModel, name='xformer_lm')
     model_p = task_p.model
     model_p.lm_tpl.packed_input = False
     model_p.lm_tpl.model_dims = self.MODEL_DIMS
@@ -124,10 +147,28 @@ class BaseLLaMA(base_experiment.BaseExperiment):
     transformer_layer_p.norm_policy = 'pre'
     transformer_layer_p.ln_tpl = ln_tpl.clone()
 
-    if self.USE_MQA:
+    if self.USE_MQA and self.GPU_FLASH_DECODING:
+      from praxis.layers import gpu_fast_attention  # pylint: disable=g-import-not-at-top
+
+      transformer_layer_p.tr_atten_tpl = pax_fiddle.Config(
+          gpu_fast_attention.GpuTritonFusedMultiQueryDotProductAttention,
+          num_kv_heads=self.NUM_KV_HEADS,
+          chunked_attn_num_seq_split=self.ATTEN_NUM_SEQ_SPLITS,
+          use_flash_decoding=True,
+      )
+      transformer_layer_p.tr_atten_tpl.combine_qkv = False
+    elif self.USE_MQA and self.QUANTIZE_KV:
+      transformer_layer_p.tr_atten_tpl = pax_fiddle.Config(
+          sax_layers.QuantizedKVMQA,
+          num_kv_heads=self.NUM_KV_HEADS,
+          chunked_attn_num_seq_split=self.ATTEN_NUM_SEQ_SPLITS,
+      )
+      transformer_layer_p.tr_atten_tpl.combine_qkv = False
+    elif self.USE_MQA:
       transformer_layer_p.tr_atten_tpl = pax_fiddle.Config(
           multi_query_attention.MultiQueryDotProductAttention,
           num_kv_heads=self.NUM_KV_HEADS,
+          chunked_attn_num_seq_split=self.ATTEN_NUM_SEQ_SPLITS,
       )
       transformer_layer_p.tr_atten_tpl.combine_qkv = False
     else:
@@ -140,7 +181,11 @@ class BaseLLaMA(base_experiment.BaseExperiment):
         pax_fiddle.Config(LLaMARotaryEmbedding)
     )
     transformer_layer_p.tr_atten_tpl.use_rotary_position_emb = True
+    transformer_layer_p.tr_atten_tpl.consolidate_rope_key_state = True
 
+    transformer_layer_p.tr_fflayer_tpl = pax_fiddle.Config(
+        sax_layers.TransformerFeedForwardWithSeqSplit
+    )
     transformer_layer_p.tr_fflayer_tpl.has_bias = False
     transformer_layer_p.tr_fflayer_tpl.ln_tpl = ln_tpl.clone()
     transformer_layer_p.tr_fflayer_tpl.activation_tpl = pax_fiddle.Config(
@@ -160,6 +205,7 @@ class BaseLLaMA(base_experiment.BaseExperiment):
         task_p,
         mesh_shape=self.ICI_MESH_SHAPE,
         decode_mesh_transpose=self.DECODE_MESH_TRANSPOSE,
+        use_batch_sharding=self.USE_BATCH_SHARDING,
     )
     # Unused.
     lp = task_p.train.learner
@@ -167,9 +213,47 @@ class BaseLLaMA(base_experiment.BaseExperiment):
     lp.optimizer = pax_fiddle.Config(
         optimizers.ShardedSgd,
         learning_rate=1e-3,
-        lr_schedule=pax_fiddle.Config(schedules.Constant)
+        lr_schedule=pax_fiddle.Config(schedules.Constant),
     )
     return task_p
+
+
+@quantization.for_transformer(quantize_on_the_fly=False)
+class BaseLLaMATest(BaseLLaMA):
+  """Small BaseLLaMA model for unit tests.
+
+  Profile with:
+  perftools/gputools/profiler/jfprof.sh :lm_cloud_test
+  """
+
+  NUM_LAYERS = 1
+  DIMS_PER_HEAD = 128
+  NUM_HEADS = 40
+  MODEL_DIMS = 5120
+  HIDDEN_DIMS = 13824
+
+  ICI_MESH_SHAPE = [1, 1, 8]
+
+  SPM_MODEL = os.path.join(os.path.dirname(__file__), 'test_model.model')
+  INPUT_SEQ_LEN = 2048
+  MAX_DECODE_STEPS = 256
+  ENABLE_GENERATE_STREAM = False
+  BATCH_SIZE = [4]
+  TOP_K = 1
+  NUM_SAMPLES = 1
+  BUCKET_KEYS = [2048]
+
+  def compiler_options(self) -> jax.stages.CompilerOptions:
+    return {
+        'xla_jf_auto_cross_replica_sharding': 'False',
+        'xla_tpu_nd_short_transfer_max_chunks': '2048',
+        'xla_tpu_perform_spmd_cse_prevention': 'True',
+        'xla_tpu_rwb_fusion': 'False',
+    }
+
+  @property
+  def test_mode(self) -> bool:
+    return True
 
 
 @servable_model_registry.register
@@ -217,9 +301,7 @@ class LLaMA7BFP16TPUv4(LLaMA7BFP16):
 
 @servable_model_registry.register
 class LLaMA7BFP16TPUv5e(LLaMA7BFP16):
-  """7B model on TPU v5e-4.
-
-  """
+  """7B model on TPU v5e-4."""
 
   BATCH_SIZE = [1]
   BUCKET_KEYS = [128]
@@ -233,7 +315,7 @@ class LLaMA7BFP16TPUv5e(LLaMA7BFP16):
 
 
 @servable_model_registry.register
-@quantization.for_transformer(quantize_on_the_fly=False)
+# @quantization.for_transformer(quantize_on_the_fly=False)
 class LLaMA7B(BaseLLaMA):
   """7B model on a A100-40GB.
 
@@ -252,6 +334,93 @@ class LLaMA7B(BaseLLaMA):
   @property
   def test_mode(self) -> bool:
     return True
+
+
+@servable_model_registry.register
+class LLaMA7BTPUv5e4(LLaMA7B):
+  """7B model on a v5e4."""
+
+  NUM_SAMPLES = 1
+  TOP_K = 1
+  BATCH_SIZE = 32
+
+  INPUT_SEQ_LEN = 1024
+  MAX_DECODE_STEPS = 1024
+  BUCKET_KEYS = [1024]
+
+  ICI_MESH_SHAPE = [1, 1, 4]
+  ENABLE_GENERATE_STREAM = False
+
+  EXTRA_INPUTS = {
+      'temperature': 0.5,
+      'per_example_max_decode_steps': 1024,
+      'per_example_top_k': 200,
+      'per_example_top_p': 0.95,
+  }
+
+  @property
+  def test_mode(self) -> bool:
+    return False
+
+
+@servable_model_registry.register
+class LLaMA7BContinuousBatchingTPUv5e4(LLaMA7BTPUv5e4):
+  """7B model on a v5e4. Test for continuous batching."""
+
+  BATCH_SIZE = 1
+  NUM_CACHE_SLOTS = 16
+
+  def score(self):
+    return None
+
+  @property
+  def test_mode(self) -> bool:
+    return False
+
+
+@servable_model_registry.register
+class LLaMA7BContinuousBatchingTPUv5e8(LLaMA7BTPUv5e4):
+  """7B model on a v5e8. Test for continuous batching."""
+
+  BATCH_SIZE = 1
+  NUM_CACHE_SLOTS = 16
+
+  ICI_MESH_SHAPE = [1, 1, 8]
+
+  def score(self):
+    return None
+
+  @property
+  def test_mode(self) -> bool:
+    return False
+
+
+@servable_model_registry.register
+class LLaMA7BH100BS8(LLaMA7BTPUv5e4):
+  """7B model on a H100."""
+
+  BATCH_SIZE = 8
+  NUM_CACHE_SLOTS = 0
+
+  ICI_MESH_SHAPE = [1, 1, 1]
+
+  @property
+  def test_mode(self) -> bool:
+    return False
+
+
+@servable_model_registry.register
+class LLaMA7BH100(LLaMA7BTPUv5e4):
+  """7B model on a H100."""
+
+  BATCH_SIZE = 8
+  NUM_CACHE_SLOTS = 16
+
+  ICI_MESH_SHAPE = [1, 1, 1]
+
+  @property
+  def test_mode(self) -> bool:
+    return False
 
 
 @servable_model_registry.register
@@ -333,10 +502,6 @@ class LLaMA70BFP16TPUv5e(BaseLLaMA):
   HIDDEN_DIMS = 28672
   USE_MQA = True
   NUM_KV_HEADS = 8
-
-  ICI_MESH_SHAPE = [1, 1, 16]
-  MAX_DECODE_STEPS = 128
-
   ENABLE_GENERATE_STREAM = False
 
   @property
@@ -345,15 +510,147 @@ class LLaMA70BFP16TPUv5e(BaseLLaMA):
 
 
 @servable_model_registry.register
+@quantization.for_transformer(quantize_on_the_fly=False, linear_only=True)
+class LLaMA70BInt8TPUv5e8(LLaMA70BFP16TPUv5e):
+  """LlaMA-2 70B model for MLPerf4 on TPU V5e-8 devices."""
+
+  ICI_MESH_SHAPE = [1, 1, 8]
+
+  INPUT_SEQ_LEN = 1024
+  BUCKET_KEYS = None
+  NUM_SAMPLES = 1
+  TOP_K = 1
+  MAX_DECODE_STEPS = 1024
+  USE_BATCH_SHARDING = True
+  ATTEN_NUM_SEQ_SPLITS = 8
+
+  # prefix batch size 1, decode batch size 72.
+  BATCH_SIZE = 1
+  NUM_CACHE_SLOTS = 72
+
+  EXTRA_INPUTS = {
+      'temperature': 0.0,
+      'per_example_max_decode_steps': 1024,
+      'per_example_top_k': 1,
+      'per_example_top_p': None,
+  }
+
+  @property
+  def test_mode(self) -> bool:
+    return False
+
+
+@servable_model_registry.register
+@quantization.for_transformer(quantize_on_the_fly=False, linear_only=True)
+class LLaMA70BInt8TokenizedInputTPUv5e8(LLaMA70BInt8TPUv5e8):
+  """LlaMA-2 70B model for MLPerf4 on TPU V5e-8 devices."""
+
+  TOKENIZED_INPUT = True
+  TOKENIZED_OUTPUT = False
+
+
+@servable_model_registry.register
+class LLaMA70BInt8TokenizedInputTPUv5e8Stream(
+    LLaMA70BInt8TokenizedInputTPUv5e8
+):
+  """LlaMA-2 70B model for MLPerf4 on TPU V5e-8 devices."""
+
+  TOKENIZED_INPUT = True
+  TOKENIZED_OUTPUT = True
+
+  ENABLE_GENERATE = False
+  ENABLE_GENERATE_STREAM = True
+
+
+@servable_model_registry.register
 class LLaMA70BFP16TPUv5e32(LLaMA70BFP16TPUv5e):
   """LlaMA-2 70B model on TPUv5-32."""
+
   ICI_MESH_SHAPE = [1, 1, 32]
 
 
 @servable_model_registry.register
 class LLaMA70BFP16TPUv5e64(LLaMA70BFP16TPUv5e):
   """LlaMA-2 70B model on TPUv5-64."""
+
   ICI_MESH_SHAPE = [1, 1, 64]
+
+
+@servable_model_registry.register
+@quantization.for_transformer(quantize_on_the_fly=False, linear_only=True)
+class LLaMA70BInt8LinearOnlyx8(LLaMA70BFP16TPUv5e):
+  """LlaMA-2 70B model with pre-quantized int8 checkpoint on 8 devices."""
+
+  USE_REPEATED_LAYER = False
+  REPEATED_LAYERS = False
+  ICI_MESH_SHAPE = [1, 1, 8]
+
+  @property
+  def test_mode(self) -> bool:
+    return False
+
+
+@servable_model_registry.register
+class LLaMA70BFP16H100x8(LLaMA70BFP16TPUv5e):
+  """LlaMA-2 70B model on H100x8."""
+
+  ICI_MESH_SHAPE = [1, 1, 8]
+
+  INPUT_SEQ_LEN = 1024
+  BUCKET_KEYS = None
+  NUM_SAMPLES = 1
+  TOP_K = 1
+  MAX_DECODE_STEPS = 1024
+  USE_BATCH_SHARDING = True
+  ATTEN_NUM_SEQ_SPLITS = 8
+
+  BATCH_SIZE = 1
+  NUM_CACHE_SLOTS = 64
+
+  GPU_FLASH_DECODING = True
+
+  EXTRA_INPUTS = {
+      'temperature': 0.5,
+      'per_example_max_decode_steps': 1024,
+      'per_example_top_k': 200,
+      'per_example_top_p': 0.95,
+  }
+
+  @property
+  def test_mode(self) -> bool:
+    return False
+
+
+@servable_model_registry.register
+@quantization.for_transformer(quantize_on_the_fly=False, linear_only=True)
+class LLaMA70BInt8H100x8(LLaMA70BFP16H100x8):
+  """LlaMA-2 70B model with pre-quantized int8 checkpoint on H100x8."""
+
+  USE_REPEATED_LAYER = False
+  REPEATED_LAYERS = False
+  ICI_MESH_SHAPE = [1, 1, 8]
+
+  BATCH_SIZE = 32
+  NUM_CACHE_SLOTS = 128
+
+
+@servable_model_registry.register
+@quantization.for_transformer(quantize_on_the_fly=False, linear_only=True)
+class LLaMA70BInt8H100x8BS32(LLaMA70BFP16H100x8):
+  """LlaMA-2 70B model with pre-quantized int8 checkpoint on H100x8."""
+
+  BATCH_SIZE = 32
+  NUM_CACHE_SLOTS = 0
+
+
+@servable_model_registry.register
+@quantization.for_transformer(quantize_on_the_fly=False, linear_only=True)
+class LLaMA70BInt8H100x8Fake(LLaMA70BInt8H100x8):
+  """LlaMA-2 70B model with fake pre-quantized int8 checkpoint on H100x8."""
+
+  @property
+  def test_mode(self) -> bool:
+    return True
 
 
 # GPT-J/NeoX family
@@ -471,7 +768,7 @@ class BaseNeoX(base_experiment.BaseExperiment):
     lp.optimizer = pax_fiddle.Config(
         optimizers.ShardedSgd,
         learning_rate=1e-3,
-        lr_schedule=pax_fiddle.Config(schedules.Constant)
+        lr_schedule=pax_fiddle.Config(schedules.Constant),
     )
     return task_p
 

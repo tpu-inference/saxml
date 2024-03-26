@@ -14,6 +14,9 @@
 
 #include "saxml/client/python/wrapper.h"
 
+#include <map>
+#include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -173,29 +176,36 @@ absl::Status LanguageModel::GenerateStream(absl::string_view prefix,
                                            const ModelOptions* options) const {
   if (!status_.ok()) return status_;
 
-  // Do not release GIL here like the other methods do because the callback
-  // contains Python code.
-  // TODO(jiawenhao): Figure out how to release and acquire GIL to enable
-  // Python multi-threading.
+  // While holding the GIL, create a shared_ptr around the Python callback.
+  auto fn = std::make_shared<GenerateCallback>(std::move(callback));
+  // Now we can release the GIL.
+  pybind11::gil_scoped_release release;
+  // Capturing the shared_ptr won't trigger the Python callback's pybind11
+  // std::function constructor, avoiding a "GIL not held" error.
   auto callback_wrapper =
-      [callback](bool last,
-                 const std::vector<::sax::client::LanguageModel::GenerateItem>&
-                     items) {
+      [fn](bool last,
+           const std::vector<::sax::client::LanguageModel::GenerateItem>&
+               items) {
+        // Reacquire the GIL because the callback contains Python code.
+        pybind11::gil_scoped_acquire acquire;
         std::vector<std::tuple<std::string, int, std::vector<double>>> r;
         r.reserve(items.size());
-        if (last) return callback(true, r);
+        if (last) return (*fn)(true, r);
         for (size_t i = 0; i < items.size(); i++) {
           auto& item = items[i];
           r.emplace_back(std::make_tuple(std::move(item.text), item.prefix_len,
                                          item.scores));
         }
-        callback(false, std::move(r));
+        (*fn)(false, std::move(r));
       };
 
+  // The shared_ptr is passed to additional owners, so the Python callback's
+  // pybind11 std::function destructor won't be called either when this function
+  // returns and the local ownership ends.
   if (options == nullptr) {
-    return model_->GenerateStream(prefix, callback_wrapper);
+    return model_->GenerateStream(prefix, std::move(callback_wrapper));
   }
-  return model_->GenerateStream(*options, prefix, callback_wrapper);
+  return model_->GenerateStream(*options, prefix, std::move(callback_wrapper));
 }
 
 absl::StatusOr<std::vector<double>> LanguageModel::Embed(
@@ -261,6 +271,21 @@ MultimodalModel::Generate(
     RETURN_IF_ERROR(model_->Generate(request, &response));
   } else {
     RETURN_IF_ERROR(model_->Generate(*options, request, &response));
+  }
+  return response;
+}
+
+absl::StatusOr<::sax::server::multimodal::ScoreResponse> MultimodalModel::Score(
+    const ::sax::server::multimodal::ScoreRequest& request,
+    const ModelOptions* options) const {
+  if (!status_.ok()) return status_;
+
+  pybind11::gil_scoped_release release;
+  ::sax::server::multimodal::ScoreResponse response;
+  if (options == nullptr) {
+    RETURN_IF_ERROR(model_->Score(request, &response));
+  } else {
+    RETURN_IF_ERROR(model_->Score(*options, request, &response));
   }
   return response;
 }
@@ -387,6 +412,7 @@ absl::StatusOr<std::vector<double>> VisionModel::Embed(
 
 absl::StatusOr<std::vector<VisionModel::PyDetectResult>> VisionModel::Detect(
     absl::string_view image, std::vector<std::string> text,
+    std::vector<std::tuple<double, double, double, double>> boxes,
     const ModelOptions* options) const {
   if (!status_.ok()) return status_;
   std::vector<PyDetectResult> ret;
@@ -394,19 +420,28 @@ absl::StatusOr<std::vector<VisionModel::PyDetectResult>> VisionModel::Detect(
   std::vector<::sax::client::VisionModel::DetectResult> result;
   {
     pybind11::gil_scoped_release release;
+    std::vector<::sax::client::VisionModel::BoundingBox> bounding_boxes;
+    bounding_boxes.reserve(boxes.size());
+    for (const auto& box : boxes) {
+      bounding_boxes.push_back({std::get<0>(box), std::get<1>(box),
+                                std::get<2>(box), std::get<3>(box)});
+    }
     if (options == nullptr) {
-      RETURN_IF_ERROR(model_->Detect(image, text, &result));
+      RETURN_IF_ERROR(model_->Detect(image, text, bounding_boxes, &result));
     } else {
-      RETURN_IF_ERROR(model_->Detect(*options, image, text, &result));
+      RETURN_IF_ERROR(
+          model_->Detect(*options, image, text, bounding_boxes, &result));
     }
   }
 
   // NOTE: pybind11::bytes must be called within GIL.
   for (size_t i = 0; i < result.size(); i++) {
     auto& item = result[i];
-    PyDetectResult res =
-        std::make_tuple(item.cx, item.cy, item.w, item.h,
-                        pybind11::bytes(std::move(item.text)), item.score);
+    PyDetectResult res = std::make_tuple(
+        item.cx, item.cy, item.w, item.h, pybind11::bytes(std::move(item.text)),
+        item.score,
+        std::make_tuple(item.mask.mask_height, item.mask.mask_width,
+                        pybind11::bytes(std::move(item.mask.mask_values))));
     ret.push_back(res);
   }
   return ret;
@@ -487,17 +522,21 @@ MultimodalModel Model::MM() { return MultimodalModel(base_, status_); }
 
 void StartDebugPort(int port) { ::sax::client::StartDebugPort(port); }
 
-absl::Status Publish(absl::string_view id, absl::string_view model_path,
-                     absl::string_view checkpoint_path, int num_replicas,
-                     const AdminOptions* options) {
+absl::Status Publish(
+    absl::string_view id, absl::string_view model_path,
+    absl::string_view checkpoint_path, int num_replicas,
+    std::optional<std::map<std::string, std::string>> overrides,
+    const AdminOptions* options) {
   pybind11::gil_scoped_release release;
+  AdminOptions default_options;
   if (options == nullptr) {
-    return ::sax::client::Publish(id, model_path, checkpoint_path,
-                                  num_replicas);
-  } else {
-    return ::sax::client::Publish(*options, id, model_path, checkpoint_path,
-                                  num_replicas);
+    options = &default_options;
   }
+  if (!overrides) {
+    overrides.emplace();
+  }
+  return ::sax::client::Publish(*options, id, model_path, checkpoint_path,
+                                num_replicas, *overrides);
 }
 
 absl::Status Unpublish(absl::string_view id, const AdminOptions* options) {

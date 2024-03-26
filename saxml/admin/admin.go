@@ -216,10 +216,14 @@ func (s *Server) Stats(ctx context.Context, in *pb.StatsRequest) (*pb.StatsRespo
 		chipTopo pb.ModelServer_ChipTopology
 	}
 	replicasPerServerType := make(map[ServerType]int32)
+	replicasPerServableModelPath := make(map[string]int32)
 
 	for _, server := range servers {
 		serverType := ServerType{server.GetModelServer().GetChipType(), server.GetModelServer().GetChipTopology()}
 		replicasPerServerType[serverType] = replicasPerServerType[serverType] + 1
+		for _, servableModelPath := range server.GetModelServer().GetServableModelPaths() {
+			replicasPerServableModelPath[servableModelPath] = replicasPerServableModelPath[servableModelPath] + 1
+		}
 	}
 
 	modelServerTypeStats := []*pb.ModelServerTypeStat{}
@@ -230,7 +234,7 @@ func (s *Server) Stats(ctx context.Context, in *pb.StatsRequest) (*pb.StatsRespo
 			NumReplicas:  replicas,
 		})
 	}
-	return &pb.StatsResponse{ModelServerTypeStats: modelServerTypeStats}, nil
+	return &pb.StatsResponse{ModelServerTypeStats: modelServerTypeStats, NumServersByServableModelPath: replicasPerServableModelPath}, nil
 }
 
 // WatchLoc handles WatchLoc RPC requests.
@@ -279,7 +283,7 @@ func (s *Server) Join(ctx context.Context, in *pb.JoinRequest) (*pb.JoinResponse
 		return nil, err
 	}
 
-	if err := s.Mgr.Join(ctx, in.GetAddress(), in.GetDebugAddress(), in.GetModelServer()); err != nil {
+	if err := s.Mgr.Join(ctx, in.GetAddress(), in.GetDebugAddress(), in.GetDataAddress(), in.GetModelServer()); err != nil {
 		return nil, err
 	}
 
@@ -296,7 +300,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("net.Listen on port %v error: %w", s.port, err)
 	}
-	gRPCServer, err := env.Get().NewServer()
+	gRPCServer, err := env.Get().NewServer(ctx)
 	if err != nil {
 		return fmt.Errorf("NewServer error: %w", err)
 	}

@@ -303,6 +303,10 @@ switched_rules_by_language(
     python = True,
 )
 
+load("@rules_python//python:repositories.bzl", "py_repositories")
+
+py_repositories()
+
 http_archive(
     name = "rules_cc",
     sha256 = "35f2fb4ea0b3e61ad64a369de284e4fbbdcdba71836a5555abb5e194cf119509",

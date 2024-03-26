@@ -32,7 +32,7 @@ namespace client {
 
 // Options contains options for creating sax client.
 struct Options {
-  int num_conn = 3;  // Perferred number of connections to sax backend.
+  int num_conn = 37;  // Perferred number of connections to sax backend.
   std::string proxy_addr = "";  // Optional proxy address.
   // Whether the model should fail fast instead of waiting for servers to be
   // available.
@@ -321,6 +321,17 @@ class MultimodalModel {
       const ::sax::server::multimodal::GenerateRequest& request,
       ::sax::server::multimodal::GenerateResponse* response) const;
 
+  // Scores the given 'ScoreRequest.prefix_items' and
+  // 'ScoreRequest.suffix_items' using the multimodal model.
+  //
+  // On success, returns OK and fills in their scores computed by the model.
+  // Otherwise, returns an error.
+  absl::Status Score(const ::sax::server::multimodal::ScoreRequest& request,
+                     ::sax::server::multimodal::ScoreResponse* response) const;
+  absl::Status Score(const ModelOptions& options,
+                     const ::sax::server::multimodal::ScoreRequest& request,
+                     ::sax::server::multimodal::ScoreResponse* response) const;
+
  private:
   explicit MultimodalModel(int64_t model_handle)
       : model_handle_(model_handle) {}
@@ -401,6 +412,21 @@ class VisionModel {
   absl::Status Embed(const ModelOptions& options, absl::string_view image_bytes,
                      std::vector<double>* embedding) const;
 
+  // The following structs mirror vision.proto's message types. Please refer to
+  // comments there for their semantics.
+  struct BoundingBox {
+    double cx;  // Center of the box in x-axis.
+    double cy;  // Center of the box in y-axis.
+    double w;   // Width of the box.
+    double h;   // Height of the box.
+  };
+
+  struct DetectionMask {
+    int32_t mask_height;
+    int32_t mask_width;
+    std::string mask_values;
+  };
+
   struct DetectResult {
     double cx;
     double cy;
@@ -408,7 +434,9 @@ class VisionModel {
     double h;
     std::string text;
     double score;
+    DetectionMask mask;
   };
+
   // Detect produces a list of bounding boxes given 'image_bytes'.
   //
   // For open-set detection models, one can pass text lists as the second
@@ -423,7 +451,15 @@ class VisionModel {
                       absl::string_view image_bytes,
                       const std::vector<std::string>& text,
                       std::vector<DetectResult>* result) const;
-
+  absl::Status Detect(absl::string_view image_bytes,
+                      const std::vector<std::string>& text,
+                      const std::vector<BoundingBox>& boxes,
+                      std::vector<DetectResult>* result) const;
+  absl::Status Detect(const ModelOptions& options,
+                      absl::string_view image_bytes,
+                      const std::vector<std::string>& text,
+                      const std::vector<BoundingBox>& boxes,
+                      std::vector<DetectResult>* result) const;
   // ImageToText produces a list of captions and scores given 'image_bytes'
   // and an optional prefix 'text'
   //
@@ -517,7 +553,8 @@ absl::Status Publish(absl::string_view id, absl::string_view model_path,
                      absl::string_view checkpoint_path, int num_replicas);
 absl::Status Publish(const AdminOptions& options, absl::string_view id,
                      absl::string_view model_path,
-                     absl::string_view checkpoint_path, int num_replicas);
+                     absl::string_view checkpoint_path, int num_replicas,
+                     const std::map<std::string, std::string>& overrides);
 
 // Unpublish a model for a given id.
 //

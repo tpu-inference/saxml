@@ -201,7 +201,10 @@ func openAdmin(id string) (string, *saxadmin.Admin, error) {
 }
 
 //export go_publish
-func go_publish(idData *C.char, idSize C.int, modelPathData *C.char, modelPathSize C.int, checkpointPathData *C.char, checkpointPathSize C.int, numReplicas C.int, timeout C.float, errMsg **C.char, errCode *C.int) {
+func go_publish(idData *C.char, idSize C.int, modelPathData *C.char, modelPathSize C.int,
+	checkpointPathData *C.char, checkpointPathSize C.int, numReplicas C.int, timeout C.float,
+	numOverrides C.int, overrideKeys **C.char, overrideKeySizes *C.int, overrideValues **C.char,
+	overrideValueSizes *C.int, errMsg **C.char, errCode *C.int) {
 	id := C.GoStringN(idData, idSize)
 	modelID, admin, err := openAdmin(id)
 	if err != nil {
@@ -212,12 +215,21 @@ func go_publish(idData *C.char, idSize C.int, modelPathData *C.char, modelPathSi
 
 	modelPath := C.GoStringN(modelPathData, modelPathSize)
 	checkpointPath := C.GoStringN(checkpointPathData, checkpointPathSize)
-	emptyOverrides := make(map[string]string)
+	overrides := make(map[string]string)
+	goOverrideKeys := unsafe.Slice(overrideKeys, numOverrides)
+	goOverrideKeySizes := unsafe.Slice(overrideKeySizes, numOverrides)
+	goOverrideValues := unsafe.Slice(overrideValues, numOverrides)
+	goOverrideValueSizes := unsafe.Slice(overrideValueSizes, numOverrides)
+	for i := 0; i < int(numOverrides); i++ {
+		key := C.GoStringN(goOverrideKeys[i], goOverrideKeySizes[i])
+		value := C.GoStringN(goOverrideValues[i], goOverrideValueSizes[i])
+		overrides[key] = value
+	}
 	ctx, cancel := createContextWithTimeout(timeout)
 	if cancel != nil {
 		defer cancel()
 	}
-	err = admin.Publish(ctx, modelID, modelPath, checkpointPath, int(numReplicas), emptyOverrides)
+	err = admin.Publish(ctx, modelID, modelPath, checkpointPath, int(numReplicas), overrides)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		*errCode = C.int(int32(errors.Code(err)))
@@ -715,6 +727,47 @@ func go_mm_generate(ptr C.long, timeout C.float, requestData *C.char, requestSiz
 	buildReturnValues(outData, outSize, errMsg, errCode, &content, nil)
 }
 
+//export go_mm_score
+func go_mm_score(ptr C.long, timeout C.float, requestData *C.char, requestSize C.int, optionsData *C.char, optionsSize C.int, outData **C.char, outSize *C.int, errMsg **C.char, errCode *C.int) {
+	mm := rcgo.Handle(ptr).Value().(*sax.MultimodalModel)
+	if mm == nil {
+		// This is not expected.
+		log.Fatalf("score() called on nil multimodal model.")
+	}
+
+	optionsByte := C.GoBytes(unsafe.Pointer(optionsData), optionsSize)
+	options := &cpb.ExtraInputs{}
+	if err := proto.Unmarshal(optionsByte, options); err != nil {
+		buildReturnValues(outData, outSize, errMsg, errCode, nil, err)
+		return
+	}
+
+	requestByte := C.GoBytes(unsafe.Pointer(requestData), requestSize)
+	request := &mmpb.ScoreRequest{}
+	if err := proto.Unmarshal(requestByte, request); err != nil {
+		buildReturnValues(outData, outSize, errMsg, errCode, nil, err)
+		return
+	}
+
+	ctx, cancel := createContextWithTimeout(timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+
+	resp, err := mm.Score(ctx, request, protoOptionToSetter(options)...)
+	if err != nil {
+		buildReturnValues(outData, outSize, errMsg, errCode, nil, err)
+		return
+	}
+
+	content, err := proto.Marshal(resp)
+	if err != nil {
+		buildReturnValues(outData, outSize, errMsg, errCode, nil, err)
+		return
+	}
+	buildReturnValues(outData, outSize, errMsg, errCode, &content, nil)
+}
+
 //////////////////////////////////////////////////////////////////////////
 // Vision model methods
 //////////////////////////////////////////////////////////////////////////
@@ -892,7 +945,7 @@ func go_vm_embed(ptr C.long, timeout C.float, imageData *C.char, imageSize C.int
 }
 
 //export go_vm_detect
-func go_vm_detect(ptr C.long, timeout C.float, imageData *C.char, imageSize C.int, textData *C.char, textSize C.int, optionsData *C.char, optionsSize C.int, outData **C.char, outSize *C.int, errMsg **C.char, errCode *C.int) {
+func go_vm_detect(ptr C.long, timeout C.float, imageData *C.char, imageSize C.int, reqData *C.char, reqSize C.int, optionsData *C.char, optionsSize C.int, outData **C.char, outSize *C.int, errMsg **C.char, errCode *C.int) {
 	vm := rcgo.Handle(ptr).Value().(*sax.VisionModel)
 	if vm == nil {
 		// This is not expected.
@@ -906,20 +959,30 @@ func go_vm_detect(ptr C.long, timeout C.float, imageData *C.char, imageSize C.in
 		return
 	}
 
-	text := C.GoStringN(textData, textSize)
+	image := C.GoBytes(unsafe.Pointer(imageData), imageSize)
+
+	requestBytes := C.GoStringN(reqData, reqSize)
 	request := &vmpb.DetectRequest{}
-	if err := proto.Unmarshal([]byte(text), request); err != nil {
+	if err := proto.Unmarshal([]byte(requestBytes), request); err != nil {
 		buildReturnValues(outData, outSize, errMsg, errCode, nil, err)
 		return
+	}
+
+	var boxes []sax.BoundingBox
+	for _, box := range request.GetBoxesOfInterest() {
+		boxes = append(boxes, sax.BoundingBox{
+			CenterX: box.GetCx(),
+			CenterY: box.GetCy(),
+			Width:   box.GetW(),
+			Height:  box.GetH(),
+		})
 	}
 
 	ctx, cancel := createContextWithTimeout(timeout)
 	if cancel != nil {
 		defer cancel()
 	}
-
-	image := C.GoBytes(unsafe.Pointer(imageData), imageSize)
-	res, err := vm.Detect(ctx, []byte(image), request.GetText(), protoOptionToSetter(options)...)
+	res, err := vm.Detect(ctx, []byte(image), request.GetText(), boxes, protoOptionToSetter(options)...)
 	if err != nil {
 		buildReturnValues(outData, outSize, errMsg, errCode, nil, err)
 		return
@@ -927,6 +990,11 @@ func go_vm_detect(ptr C.long, timeout C.float, imageData *C.char, imageSize C.in
 	ret := &vmpb.DetectResponse{}
 	items := []*vmpb.BoundingBox{}
 	for _, v := range res {
+		mask := &vmpb.DetectionMask{
+			MaskHeight: v.Mask.Height,
+			MaskWidth:  v.Mask.Width,
+			MaskValues: v.Mask.MaskValues,
+		}
 		item := &vmpb.BoundingBox{
 			Cx:    v.CenterX,
 			Cy:    v.CenterY,
@@ -934,6 +1002,7 @@ func go_vm_detect(ptr C.long, timeout C.float, imageData *C.char, imageSize C.in
 			H:     v.Height,
 			Text:  v.Text,
 			Score: v.Score,
+			Mask:  mask,
 		}
 		items = append(items, item)
 	}
@@ -1099,7 +1168,7 @@ func go_vm_video_to_text(ptr C.long, timeout C.float, imageFramesData **C.char,
 }
 
 //export go_custom
-func go_custom(ptr C.long, requestData unsafe.Pointer, requestSize C.int, methodNameData *C.char, methodNameSize C.int, optionsData *C.char, optionsSize C.int, outData **C.char, outSize *C.int, errMsg **C.char, errCode *C.int) {
+func go_custom(ptr C.long, timeout C.float, requestData unsafe.Pointer, requestSize C.int, methodNameData *C.char, methodNameSize C.int, optionsData *C.char, optionsSize C.int, outData **C.char, outSize *C.int, errMsg **C.char, errCode *C.int) {
 	custom := rcgo.Handle(ptr).Value().(*sax.CustomModel)
 	if custom == nil {
 		// This is not expected.
@@ -1113,9 +1182,14 @@ func go_custom(ptr C.long, requestData unsafe.Pointer, requestSize C.int, method
 		return
 	}
 
+	ctx, cancel := createContextWithTimeout(timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+
 	request := C.GoBytes(requestData, requestSize)
 	methodName := C.GoStringN(methodNameData, methodNameSize)
-	res, err := custom.Custom(context.Background(), request, methodName, protoOptionToSetter(options)...)
+	res, err := custom.Custom(ctx, request, methodName, protoOptionToSetter(options)...)
 	if err != nil {
 		buildReturnValues(outData, outSize, errMsg, errCode, nil, err)
 		return
@@ -1136,7 +1210,7 @@ func go_custom(ptr C.long, requestData unsafe.Pointer, requestSize C.int, method
 
 //export go_start_debug
 func go_start_debug(port C.int) {
-	sax.StartDebugPort(int(port))
+	sax.StartDebugPort(context.Background(), int(port))
 }
 
 func main() {}

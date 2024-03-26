@@ -39,11 +39,20 @@ const (
 	ServerStatusPage
 )
 
+// ModelInfo contains metadata of a published model together with
+// its aggregated usage statistics.
+type ModelInfo struct {
+	Model *pb.PublishedModel
+
+	// Stats
+	SuccessesPerSecond float32
+}
+
 // StatusPageData contains data needed for generating a server status page.
 type StatusPageData struct {
 	Kind    StatusPageKind
 	SaxCell string
-	Models  []*pb.PublishedModel
+	Models  []*ModelInfo
 	Servers []*pb.JoinedModelServer
 }
 
@@ -68,12 +77,15 @@ type Env interface {
 	// Init initializes the platform, such as parsing command line flags, in non-test binaries.
 	Init(ctx context.Context)
 
+	// InTest returns whether the process is running in a test.
+	InTest(ctx context.Context) bool
+
 	// ReadFile reads the content of a file.
 	ReadFile(ctx context.Context, path string) ([]byte, error)
 	// ReadFile reads the content of a file, caching the result on repeated reads if possible.
 	ReadCachedFile(ctx context.Context, path string) ([]byte, error)
-	// WriteFile writes the content of a file.
-	WriteFile(ctx context.Context, path string, data []byte) error
+	// WriteFile writes the content of a file. If writeACL is empty, no write ACL is added.
+	WriteFile(ctx context.Context, path, writeACL string, data []byte) error
 	// WriteFileAtomically writes the content of a file to file systems without versioning support.
 	WriteFileAtomically(ctx context.Context, path string, data []byte) error
 	// FileExists checks the existence of a file.
@@ -84,7 +96,9 @@ type Env interface {
 	// FsRootDir reformats the directory path where the admin server periodically dumps its state.
 	FsRootDir(fsRoot string) string
 	// CreateDir creates a directory.
-	CreateDir(ctx context.Context, path, acl string) error
+	CreateDir(ctx context.Context, path, writeACL string) error
+	// DeleteDir deletes a directory.
+	DeleteDir(ctx context.Context, path string) error
 	// ListSubdirs lists subdirectories in a directory.
 	ListSubdirs(ctx context.Context, path string) ([]string, error)
 	// DirExists checks the existence of a directory.
@@ -110,7 +124,7 @@ type Env interface {
 	// RequiredACLNamePrefixList returns a list of possible strings required to prefix all ACL names.
 	RequiredACLNamePrefixList() []string
 	// NewServer creates a server.
-	NewServer() (Server, error)
+	NewServer(ctx context.Context) (Server, error)
 
 	// NewEventLogger creates new client for logging lineage events.
 	NewEventLogger() eventlog.Logger

@@ -19,7 +19,14 @@ licenses(["notice"])
 # listing your team. Your model params and implementation should be in
 # that directory. If the above suggestion is not actionable for you,
 # please schedule a meeting talking to zhifengc@.
-package_group(name = "friends")
+package_group(
+    name = "friends",
+    packages = [
+        "//waymo/planner/...",  # //waymo/... is siloed.
+        "//waymo/research/...",  # //waymo/... is siloed.
+        "//wireless/android/apps/pixel/agent/ml/serving/sax/...",
+    ],
+)
 
 bzl_library(
     name = "build_defs_bzl",
@@ -74,6 +81,7 @@ py_strict_test(
     deps = [
         ":multi_host_sync",
         "//third_party/py/absl-py/testing:absltest",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
     ],
 )
 
@@ -94,6 +102,7 @@ py_strict_test(
     deps = [
         ":servable_model_params",
         "//third_party/py/absl-py/testing:absltest",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
     ],
 )
 
@@ -116,6 +125,7 @@ py_strict_test(
         ":all_imports",
         ":servable_model_registry",
         "//third_party/py/absl-py/testing:absltest",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
     ],
 )
 
@@ -158,6 +168,7 @@ py_strict_test(
     deps = [
         ":utils",
         "//third_party/py/absl-py/testing:absltest",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
         "//third_party/py/numpy",
     ],
 )
@@ -179,9 +190,10 @@ py_strict_test(
     srcs_version = "PY3",
     deps = [
         ":validate",
-        "//saxml/protobuf:test_py_pb2",
-        "//third_party/py/absl-py/testing:absltest",
         "//third_party/py/grpcio",
+        "//third_party/py/absl-py/testing:absltest",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
+        "//saxml/protobuf:test_py_pb2",
     ],
 )
 
@@ -199,9 +211,10 @@ py_strict_test(
     srcs_version = "PY3",
     deps = [
         ":proto_util",
-        "//saxml/protobuf:admin_py_pb2",
         "//third_party/py/absl-py/testing:absltest",
         "//third_party/py/absl-py/testing:parameterized",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
+        "//saxml/protobuf:admin_py_pb2",
     ],
 )
 
@@ -234,7 +247,23 @@ pytype_strict_library(
         "//third_party/py/absl-py/logging",
         "//third_party/py/grpcio",
         "//third_party/py/grpcio-reflection",
+        "//third_party/py/jaxtyping",
+        "//third_party/py/numpy",
         "@com_google_protobuf//:protobuf_python",
+    ],
+)
+
+py_strict_test(
+    name = "model_service_base_test",
+    srcs = ["model_service_base_test.py"],
+    deps = [
+        ":model_service_base",
+        ":utils",
+        "//saxml/protobuf:common_py_pb2",
+        "//saxml/protobuf:modelet_py_pb2",
+        "//third_party/py/absl-py/testing:absltest",
+        "//third_party/py/numpy",
+        "//third_party/py/portpicker",
     ],
 )
 

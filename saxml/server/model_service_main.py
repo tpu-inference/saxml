@@ -22,7 +22,6 @@ from absl import logging
 import grpc
 import jax
 from jax.experimental.compilation_cache import compilation_cache
-import jax.experimental.maps  # needed by experimental_xmap_spmd_lowering* below
 from saxml.protobuf import modelet_pb2
 from saxml.protobuf import modelet_pb2_grpc
 from saxml.server import model_service_base
@@ -52,6 +51,9 @@ _PLATFORM_CHIP = flags.DEFINE_string(
 )
 _PLATFORM_TOPOLOGY = flags.DEFINE_string(
     'platform_topology', '1', 'Optional topology description.'
+)
+_TAGS = flags.DEFINE_list(
+    'tags', [], 'Optional list of string tags.'
 )
 _JAX_PROFILER_PORT = flags.DEFINE_integer(
     'jax_profiler_port',
@@ -130,6 +132,7 @@ def _load_static_model(
       stub.Load(req)
     except grpc.RpcError as e:
       logging.exception('Exception during loading: %s', e)
+      raise e
 
 
 def setup_jax(
@@ -147,14 +150,10 @@ def setup_jax(
 
   # Initializing cache
   if _JAX_CACHE_DIR.value is not None:
-    compilation_cache.initialize_cache(_JAX_CACHE_DIR.value)
+    compilation_cache.set_cache_dir(_JAX_CACHE_DIR.value)
 
   # Log tracing and compilation time.
-  jax.config.update('jax_log_compiles', True)
-  # We use xmap only with SPMD.
-  jax.config.update('experimental_xmap_spmd_lowering', True)
-  # Use the manual partitioning lowering of xmap to avoid vectorization.
-  jax.config.update('experimental_xmap_spmd_lowering_manual', True)
+  jax.config.update('jax_log_compiles', logging.level_debug())
 
   if jax_enable_checks:
     jax.config.update('jax_enable_checks', True)
@@ -216,7 +215,8 @@ def run(channel_creds: Optional[grpc.ChannelCredentials]) -> None:
       admin_port=_ADMIN_PORT.value,
       platform_chip=_PLATFORM_CHIP.value,
       platform_topology=_PLATFORM_TOPOLOGY.value,
-      spmd_backend=spmd_bknd,
+      tags=_TAGS.value,
+      backend=spmd_bknd,
   )
   # Start jax.profiler for TensorBoard and profiling in open source.
   if _JAX_PROFILER_PORT.value:

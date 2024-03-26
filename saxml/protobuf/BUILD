@@ -1,6 +1,5 @@
 # Protobuf definitions for Sax.
 
-# unused internal Kotlin Protobuf load
 load(
     "//saxml:saxml.bzl",
     "cc_grpc_library",
@@ -8,13 +7,15 @@ load(
     "cc_stubby_library",
     "go_grpc_library",
     "go_proto_library",
+    "jspb_proto_library",
+    "kt_jvm_grpc_library",
+    "kt_jvm_proto_library",
+    "kt_jvm_stubby_library",
     "proto_library",
     "py_grpc_library",
     "py_proto_library",
     "rpc_endpoint_interface",
 )
-# unused internal JS Protobuf load
-# unused internal Kotlin gRPC load
 
 package(
     default_visibility = ["//saxml:internal"],
@@ -25,7 +26,13 @@ package_group(
     includes = [
         "//saxml:internal",
     ],
-    packages = ["//research/bigpicture/llm_api_use/sax/..."],
+    packages = [
+        "//cloud/security/ctd/aiassist/saxclient/...",
+        "//java/com/google/vr/multimodal/...",
+        "//javatests/com/google/vr/multimodal/...",
+        "//research/bigpicture/llm_api_use/sax/...",
+        "//vr/multimodal/...",
+    ],
 )
 
 proto_library(
@@ -49,6 +56,18 @@ cc_proto_library(
 py_proto_library(
     name = "common_py_pb2",
     api_version = 2,
+    visibility = ["//visibility:public"],
+    deps = [":common_proto"],
+)
+
+java_proto_library(
+    name = "common_java_proto",
+    visibility = ["//visibility:public"],
+    deps = [":common_proto"],
+)
+
+kt_jvm_proto_library(
+    name = "common_kt_proto",
     visibility = ["//visibility:public"],
     deps = [":common_proto"],
 )
@@ -102,7 +121,9 @@ cc_proto_library(
 cc_stubby_library(
     name = "admin_cc_stubby",
     srcs = [":admin_proto"],
-    visibility = [":sax_rpc_visibility"],
+    visibility = [
+        "//visibility:private",  # Only private by automation, not intent. Owner may accept CLs adding visibility. See go/scheuklappen#explicit-private.
+    ],
     deps = [":admin_cc_proto"],
 )
 
@@ -175,6 +196,7 @@ proto_library(
     name = "custom_proto",
     srcs = ["custom.proto"],
     has_services = True,
+    use_java_stubby_library = True,
     visibility = ["//visibility:public"],
     deps = [":common_proto"],
 )
@@ -188,6 +210,7 @@ rpc_endpoint_interface(
 
 cc_proto_library(
     name = "custom_cc_proto",
+    visibility = ["//visibility:public"],
     deps = [":custom_proto"],
 )
 
@@ -226,6 +249,25 @@ go_grpc_library(
     deps = [":custom_go_proto"],
 )
 
+java_proto_library(
+    name = "custom_java_proto",
+    visibility = ["//visibility:public"],
+    deps = [":custom_proto"],
+)
+
+kt_jvm_proto_library(
+    name = "custom_kt_proto",
+    visibility = ["//visibility:public"],
+    deps = [":custom_proto"],
+)
+
+kt_jvm_stubby_library(
+    name = "custom_kt_stubby",
+    srcs = [":custom_proto"],
+    visibility = [":sax_rpc_visibility"],
+    deps = [":custom_kt_proto"],
+)
+
 proto_library(
     name = "lm_proto",
     srcs = ["lm.proto"],
@@ -244,7 +286,9 @@ rpc_endpoint_interface(
 
 cc_proto_library(
     name = "lm_cc_proto",
-    visibility = ["//saxml:internal"],
+    visibility = [
+        "//visibility:public",
+    ],
     deps = [":lm_proto"],
 )
 
@@ -261,6 +305,12 @@ py_proto_library(
     extra_deps = [":common_py_pb2"],
     visibility = ["//visibility:public"],
     deps = [":lm_proto"],
+)
+
+cc_grpc_library(
+    name = "lm_cc_grpc",
+    srcs = [":lm_proto"],
+    deps = [":lm_cc_proto"],
 )
 
 py_grpc_library(
@@ -284,10 +334,37 @@ go_grpc_library(
     deps = [":lm_go_proto"],
 )
 
+java_proto_library(
+    name = "lm_java_proto",
+    visibility = ["//visibility:public"],
+    deps = [":lm_proto"],
+)
+
+kt_jvm_proto_library(
+    name = "lm_kt_proto",
+    visibility = ["//visibility:public"],
+    deps = [":lm_proto"],
+)
+
+kt_jvm_stubby_library(
+    name = "lm_kt_stubby",
+    srcs = [":lm_proto"],
+    visibility = [":sax_rpc_visibility"],
+    deps = [":lm_kt_proto"],
+)
+
+kt_jvm_grpc_library(
+    name = "lm_kt_proto_grpc",
+    srcs = [":lm_proto"],
+    visibility = ["//java/com/google/wireless/android/devtools/studio/ml/eval/auto:__subpackages__"],
+    deps = [":lm_kt_proto"],
+)
+
 proto_library(
     name = "audio_proto",
     srcs = ["audio.proto"],
     has_services = True,
+    use_java_stubby_library = True,
     visibility = ["//visibility:public"],
     deps = [":common_proto"],
 )
@@ -339,10 +416,30 @@ go_grpc_library(
     deps = [":audio_go_proto"],
 )
 
+java_proto_library(
+    name = "audio_java_proto",
+    visibility = ["//visibility:public"],
+    deps = [":audio_proto"],
+)
+
+kt_jvm_proto_library(
+    name = "audio_kt_proto",
+    visibility = ["//visibility:public"],
+    deps = [":audio_proto"],
+)
+
+kt_jvm_stubby_library(
+    name = "audio_kt_stubby",
+    srcs = [":audio_proto"],
+    visibility = [":sax_rpc_visibility"],
+    deps = [":audio_kt_proto"],
+)
+
 proto_library(
     name = "vision_proto",
     srcs = ["vision.proto"],
     has_services = True,
+    use_java_stubby_library = True,
     visibility = ["//visibility:public"],
     deps = [":common_proto"],
 )
@@ -393,6 +490,25 @@ go_grpc_library(
     srcs = [":vision_proto"],
     extra_deps = [":common_go_proto"],
     deps = [":vision_go_proto"],
+)
+
+java_proto_library(
+    name = "vision_java_proto",
+    visibility = ["//visibility:public"],
+    deps = [":vision_proto"],
+)
+
+kt_jvm_proto_library(
+    name = "vision_kt_proto",
+    visibility = ["//visibility:public"],
+    deps = [":vision_proto"],
+)
+
+kt_jvm_stubby_library(
+    name = "vision_kt_stubby",
+    srcs = [":vision_proto"],
+    visibility = [":sax_rpc_visibility"],
+    deps = [":vision_kt_proto"],
 )
 
 proto_library(
@@ -450,6 +566,25 @@ go_grpc_library(
     srcs = [":multimodal_proto"],
     extra_deps = [":common_go_proto"],
     deps = [":multimodal_go_proto"],
+)
+
+kt_jvm_proto_library(
+    name = "multimodal_kt_proto",
+    visibility = ["//visibility:public"],
+    deps = [":multimodal_proto"],
+)
+
+kt_jvm_stubby_library(
+    name = "multimodal_kt_stubby",
+    srcs = [":multimodal_proto"],
+    visibility = [":sax_rpc_visibility"],
+    deps = [":multimodal_kt_proto"],
+)
+
+jspb_proto_library(
+    name = "multimodal_jspb_proto",
+    visibility = ["//visibility:public"],
+    deps = [":multimodal_proto"],
 )
 
 proto_library(

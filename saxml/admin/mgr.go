@@ -22,9 +22,11 @@ import (
 	"sync"
 	"time"
 
+	"flag"
 	log "github.com/golang/glog"
 	"google.golang.org/protobuf/proto"
 	"github.com/pborman/uuid"
+	"saxml/admin/assigner"
 	"saxml/admin/protobuf"
 	"saxml/admin/state"
 	"saxml/admin/validator"
@@ -47,6 +49,8 @@ var (
 	// Model servers that haven't sent any valid GetStatus response for this long will get pruned.
 	// This should be longer than refreshPeriod in the state package.
 	pruneTimeout = time.Second * 25
+
+	expAssigner = flag.Bool("sax_admin_exp_assigner", false, "If true, experiments the assigner implementation.")
 )
 
 // SetOptionsForTesting updates refreshPeriod and pruneTimeout for tests.
@@ -250,6 +254,28 @@ func (m *Mgr) ListAll() []*apb.PublishedModel {
 	return publishedModels
 }
 
+// GetStatsPerModel returns a map from model fullnames to model's
+// stats (ops/second) aggregated over servers specified by 'addrs'.
+func (m *Mgr) GetStatsPerModel(addrs map[string]bool) map[naming.ModelFullName]float32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	ret := make(map[naming.ModelFullName]float32)
+	for addr, modelet := range m.modelets {
+		if _, ok := addrs[string(addr)]; ok {
+			for fullName, seenModel := range modelet.SeenModels() {
+				var rate float32 = 0
+				for _, stats := range seenModel.Info.Stats {
+					rate = rate + stats.SuccessesPerSecond
+				}
+				ret[fullName] = ret[fullName] + rate
+			}
+		}
+	}
+
+	return ret
+}
+
 // WatchLoc watches changes of the model server addresses after the given seqno.
 func (m *Mgr) WatchLoc(ctx context.Context, fullName string, seqno int32) (*watchable.WatchResult, error) {
 	modelFullName, err := naming.NewModelFullName(fullName)
@@ -293,11 +319,11 @@ func (m *Mgr) FindModel(fullName modelFullName) *apb.Model {
 }
 
 // Join lets one model server join from an address.
-func (m *Mgr) Join(ctx context.Context, addr, debugAddr string, specs *apb.ModelServer) error {
+func (m *Mgr) Join(ctx context.Context, addr, debugAddr, dataAddr string, specs *apb.ModelServer) error {
 	maddr := modeletAddr(addr)
 
 	createNewServerState := func() error {
-		modelServer := state.New(addr, debugAddr, protobuf.NewModelServer(specs), m.eventLogger)
+		modelServer := state.New(addr, debugAddr, dataAddr, protobuf.NewModelServer(specs), m.eventLogger)
 		if err := modelServer.Start(ctx, m); err != nil {
 			return fmt.Errorf("failed to start a connection with %v: %w", addr, err)
 		}
@@ -310,7 +336,7 @@ func (m *Mgr) Join(ctx context.Context, addr, debugAddr string, specs *apb.Model
 			// Only models loading or loaded should get added to the address watcher.
 			for fullName := range modelServer.WantedModels() {
 				model := m.models[fullName]
-				model.addrWatcher.Add(addr)
+				model.addrWatcher.Add(modelServer.DataAddr)
 			}
 			// Be conservative and only add loaded models to the waiter. Models that are loading, when a
 			// model server joins an admin server, are not counted toward a pending WaitForReady request.
@@ -319,7 +345,7 @@ func (m *Mgr) Join(ctx context.Context, addr, debugAddr string, specs *apb.Model
 				if !ok {
 					continue
 				}
-				if seenModel.Status == protobuf.Loaded {
+				if seenModel.Info.Status == protobuf.Loaded {
 					model.waiter.Add(1)
 				}
 			}
@@ -377,19 +403,32 @@ func (m *Mgr) GetStatus(ctx context.Context, addr string, full bool) (*mpb.GetSt
 
 func (m *Mgr) makeJoinedModelServerLocked(addr string, modelet *modeletState) (*apb.JoinedModelServer, error) {
 	statuses := map[string]cpb.ModelStatus{}
+	var successesPerSecond, errorsPerSecond, meanLatencyInSeconds float32 = 0., 0., 0.
 	for fullName, status := range modelet.SeenModels() {
-		s, err := status.Status.ToProto()
+		s, err := status.Info.Status.ToProto()
 		if err != nil {
 			return nil, err
 		}
 		statuses[fullName.ModelFullName()] = s
+		for _, stats := range status.Info.Stats {
+			successesPerSecond += stats.SuccessesPerSecond
+			errorsPerSecond += stats.ErrorsPerSecond
+			meanLatencyInSeconds += stats.MeanLatencyInSeconds * stats.SuccessesPerSecond
+		}
+	}
+	if successesPerSecond != 0 {
+		meanLatencyInSeconds = meanLatencyInSeconds / successesPerSecond
 	}
 	return &apb.JoinedModelServer{
-		ModelServer:  modelet.Specs.ToProto(),
-		Address:      addr,
-		DebugAddress: modelet.DebugAddr,
-		LastJoinMs:   modelet.LastPing().UnixMilli(),
-		LoadedModels: statuses,
+		ModelServer:          modelet.Specs.ToProto(),
+		Address:              addr,
+		DebugAddress:         modelet.DebugAddr,
+		DataAddress:          modelet.DataAddr,
+		LastJoinMs:           modelet.LastPing().UnixMilli(),
+		LoadedModels:         statuses,
+		SuccessesPerSecond:   successesPerSecond,
+		ErrorsPerSecond:      errorsPerSecond,
+		MeanLatencyInSeconds: meanLatencyInSeconds,
 	}, nil
 }
 
@@ -459,7 +498,7 @@ func (m *Mgr) pruneModelets(timeout time.Duration) {
 		for fullName := range modelet.WantedModels() {
 			model, ok := m.models[fullName]
 			if ok {
-				model.addrWatcher.Del(string(addr))
+				model.addrWatcher.Del(modelet.DataAddr)
 			}
 		}
 		// Subtract models that are loaded from the waiter. Also be conservative and subtract loading
@@ -469,7 +508,7 @@ func (m *Mgr) pruneModelets(timeout time.Duration) {
 			if !ok {
 				continue
 			}
-			if seenModel.Status == protobuf.Loaded {
+			if seenModel.Info.Status == protobuf.Loaded {
 				model.waiter.Add(-1)
 			}
 		}
@@ -498,6 +537,9 @@ type RefreshResult struct {
 
 	// Model servers assigned by the call to Refresh.
 	NewlyAssigned map[modeletAddr]modelFullName
+
+	// Temporarily store data address for later usage by unloadModels
+	DataAddress map[modeletAddr]string
 }
 
 // ComputeAssignment computes new model-to-server assignment.
@@ -543,7 +585,33 @@ func (m *Mgr) ComputeAssignment() RefreshResult {
 			}
 		}
 	}
+
+	// Sort the assignments so that loaded models come first in the list.
+	// Since we unload starting at the end of the list, this encourages us to keep loaded models
+	// and unload models from tasks that are loading/failed/unloading.
+	modelIsLoaded := func(modelName naming.ModelFullName, addr modeletAddr) bool {
+		for seenModelName, modelWithStatus := range m.modelets[addr].SeenModels() {
+			if seenModelName == modelName {
+				return modelWithStatus.Info.Status == protobuf.Loaded
+			}
+		}
+		return false
+	}
 	log.V(1).Infof("Current assignment: %v", currentAssignment)
+	for modelName, addresses := range currentAssignment {
+		sort.Slice(addresses, func(i int, j int) bool {
+			iLoaded := modelIsLoaded(modelName, addresses[i])
+			jLoaded := modelIsLoaded(modelName, addresses[j])
+
+			// i < j iff i is loaded and j is not.
+			if iLoaded && !jLoaded {
+				return true
+			}
+
+			return false
+		})
+	}
+	log.V(1).Infof("Current assignment sorted: %v", currentAssignment)
 
 	// Find and index idle model servers by servable model paths.
 	idle := map[string]map[modeletAddr]bool{} // model path -> set of model servers able to serve it
@@ -610,7 +678,14 @@ func (m *Mgr) ComputeAssignment() RefreshResult {
 	}
 	log.V(1).Infof("New assignment: %v", newAssignment)
 
-	return RefreshResult{totalRequested, alreadyAssigned, pendingUnpublished, newAssignment, newlyUnassigned, newlyAssigned}
+	// In unloadModels, it needs dataAddr for newly unassigned models
+	// Construct a temporary dictionary mapping from addr to dataAddr
+	dataAddress := map[modeletAddr]string{}
+	for maddr := range newlyUnassigned {
+		dataAddress[maddr] = m.modelets[maddr].DataAddr
+	}
+
+	return RefreshResult{totalRequested, alreadyAssigned, pendingUnpublished, newAssignment, newlyUnassigned, newlyAssigned, dataAddress}
 }
 
 func (m *Mgr) installAssignment(assignment map[modelFullName][]modeletAddr) {
@@ -621,7 +696,7 @@ func (m *Mgr) installAssignment(assignment map[modelFullName][]modeletAddr) {
 }
 
 // loadModels loads models onto newly assigned modelets in parallel.
-func (m *Mgr) loadModels(ctx context.Context, newlyAssigned map[modeletAddr]modelFullName) {
+func (m *Mgr) loadModels(ctx context.Context, newlyAssigned []assigner.Action) {
 	load := func(ctx context.Context, fullName modelFullName, addr modeletAddr) error {
 		m.mu.Lock()
 		modelet, ok := m.modelets[addr]
@@ -648,11 +723,13 @@ func (m *Mgr) loadModels(ctx context.Context, newlyAssigned map[modeletAddr]mode
 		if !ok {
 			return fmt.Errorf("model %v has been unpublished", fullName)
 		}
-		model.addrWatcher.Add(string(addr))
+		model.addrWatcher.Add(modelet.DataAddr)
 		return nil
 	}
 
-	for addr, fullName := range newlyAssigned {
+	for _, item := range newlyAssigned {
+		addr := modeletAddr(item.Addr)
+		fullName := item.Model
 		log.V(2).Infof("Loading model %v onto model server %v", fullName, addr)
 		go func(fullName modelFullName, addr modeletAddr) {
 			if err := load(ctx, fullName, modeletAddr(addr)); err != nil {
@@ -665,8 +742,10 @@ func (m *Mgr) loadModels(ctx context.Context, newlyAssigned map[modeletAddr]mode
 }
 
 // unloadModels unloads models from newly unassigned modelets in parallel.
-func (m *Mgr) unloadModels(ctx context.Context, newlyUnassigned map[modeletAddr]modelFullName) {
-	unload := func(ctx context.Context, fullName modelFullName, addr modeletAddr) error {
+// addrWatcher needs dataAddr to remove unloaded models, and `dataAddress“ is dictionary from
+// addr to dataAddr.
+func (m *Mgr) unloadModels(ctx context.Context, newlyUnassigned []assigner.Action, dataAddress map[modeletAddr]string) {
+	unload := func(ctx context.Context, fullName modelFullName, addr modeletAddr, dataAddr string) error {
 		m.mu.Lock()
 		model, ok := m.models[fullName]
 		var waiter *waitable.Waitable
@@ -676,7 +755,7 @@ func (m *Mgr) unloadModels(ctx context.Context, newlyUnassigned map[modeletAddr]
 			// ComputeAssignment but before unloadModels, modelets may not have addr anymore, but
 			// we still need to remove addr from the address watcher. See the matching comment in
 			// pruneModelets for reference.
-			model.addrWatcher.Del(string(addr))
+			model.addrWatcher.Del(dataAddr)
 			waiter = model.waiter
 		}
 		modelet, ok := m.modelets[addr]
@@ -691,15 +770,17 @@ func (m *Mgr) unloadModels(ctx context.Context, newlyUnassigned map[modeletAddr]
 		return modelet.Unload(ctx, fullName, waiter)
 	}
 
-	for addr, fullName := range newlyUnassigned {
+	for _, item := range newlyUnassigned {
+		addr := modeletAddr(item.Addr)
+		fullName := item.Model
 		log.V(2).Infof("Unloading model %v from model server %v", fullName, addr)
-		go func(fullName modelFullName, addr modeletAddr) {
-			if err := unload(ctx, fullName, modeletAddr(addr)); err != nil {
+		go func(fullName modelFullName, addr modeletAddr, dataAddr string) {
+			if err := unload(ctx, fullName, modeletAddr(addr), dataAddr); err != nil {
 				log.Errorf("Failed to unload model %v from model server %v: %v", fullName, addr, err)
 			} else {
 				log.V(2).Infof("Unloaded model %v from model server %v", fullName, addr)
 			}
-		}(fullName, addr)
+		}(fullName, addr, dataAddress[addr])
 	}
 }
 
@@ -719,16 +800,91 @@ func (m *Mgr) freeUnpublishedNames(unpublished map[modelFullName]bool) {
 func (m *Mgr) Refresh(ctx context.Context) {
 	// Remove dead model servers.
 	m.pruneModelets(pruneTimeout)
-	// Compute new assignment.
-	result := m.ComputeAssignment()
-	// Install the new assignment.
-	m.installAssignment(result.NewAssignment)
-	// Unload and load models according to assignment results.
-	m.unloadModels(ctx, result.NewlyUnassigned)
-	m.loadModels(ctx, result.NewlyAssigned)
-	// Now that unload calls have been issued, make model full names unpublished before the
-	// ComputeAssignment call available for use again.
-	m.freeUnpublishedNames(result.pendingUnpublished)
+
+	var pendingUnpublished map[modelFullName]bool
+	if !*expAssigner {
+		// Compute new assignment.
+		result := m.ComputeAssignment()
+		// Install the new assignment.
+		m.installAssignment(result.NewAssignment)
+		// Unload models according to assignment results.
+		var toUnload []assigner.Action
+		for addr, name := range result.NewlyUnassigned {
+			toUnload = append(toUnload, assigner.Action{Addr: assigner.ServerAddr(addr), Model: name})
+		}
+		m.unloadModels(ctx, toUnload, result.DataAddress)
+		// Load models according to assignment results.
+		var toLoad []assigner.Action
+		for addr, name := range result.NewlyAssigned {
+			toLoad = append(toLoad, assigner.Action{Addr: assigner.ServerAddr(addr), Model: name})
+		}
+		m.loadModels(ctx, toLoad)
+
+		pendingUnpublished = result.pendingUnpublished
+	} else {
+		a := assigner.New()
+
+		// From server addrs to the actuall data access host:port addrs.
+		dataAddress := map[modeletAddr]string{}
+		pendingUnpublished = map[modelFullName]bool{}
+		{
+			m.mu.RLock()
+
+			// Take a snapshot of models recently unpublished. Their
+			// unload ops, if needed, should be generated below and
+			// placed in newlyUnassigned. Remove them from
+			// m.pendingUnpublished after these unload ops are
+			// successfully issued.
+			for fullName := range m.pendingUnpublished {
+				pendingUnpublished[fullName] = true
+			}
+
+			// Tells the assigner about servers.
+			for addr, state := range m.modelets {
+				sinfo := assigner.NewServerInfo(state.Specs)
+				wanted := state.WantedModels()
+				seen := state.SeenModels()
+				dataAddress[addr] = state.DataAddr
+				for name := range wanted {
+					var status protobuf.ModelStatus
+					if found, ok := seen[name]; !ok {
+						status = protobuf.None
+					} else {
+						status = found.Info.Status
+					}
+					sinfo.AddLoadedModel(name, status)
+				}
+				a.AddServer(assigner.ServerAddr(addr), sinfo)
+			}
+
+			// Tells the assigner about published models.
+			for fullName, model := range m.models {
+				a.AddModel(fullName, assigner.NewModelInfo(model.specs))
+			}
+
+			m.mu.RUnlock()
+		}
+
+		// Compute the new assignment outside m.mu
+		a.Assign()
+
+		newAssign := map[modelFullName][]modeletAddr{}
+		for fullName, addrs := range a.GetAssignment() {
+			var x []modeletAddr
+			for _, addr := range addrs {
+				x = append(x, modeletAddr(addr))
+			}
+			newAssign[fullName] = x
+		}
+		m.installAssignment(newAssign)
+		m.unloadModels(ctx, a.GetToUnload(), dataAddress)
+		m.loadModels(ctx, a.GetToLoad())
+	}
+
+	// Now that unload calls have been issued, make model full names
+	// unpublished before the ComputeAssignment call available for use
+	// again.
+	m.freeUnpublishedNames(pendingUnpublished)
 }
 
 // Restore restores the manager state from its backing store.

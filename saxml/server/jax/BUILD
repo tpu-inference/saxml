@@ -43,6 +43,7 @@ py_strict_test(
     deps = [
         ":serialize",
         "//third_party/py/absl-py/testing:absltest",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
         "//third_party/py/jax",
         "//third_party/py/numpy",
     ],

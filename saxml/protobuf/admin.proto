@@ -114,6 +114,7 @@ message ModelServer {
     CHIP_TYPE_GPU_T4 = 13;
     CHIP_TYPE_GPU_A100 = 11;
     CHIP_TYPE_GPU_H100 = 14;
+    CHIP_TYPE_GPU_L4 = 16;
     CHIP_TYPE_CPU = 12;
   }
   ChipType chip_type = 1;
@@ -151,7 +152,16 @@ message ModelServer {
   }
   ChipTopology chip_topology = 2;
 
+  // The server informs the admin which model paths it supported. Hence,
+  // it is expected that the admin will only ask this server to load models
+  // whose model paths in this list.
+  //
+  // E.g., saxml.lm.params.Gemma7B
   repeated string servable_model_paths = 3;
+
+  // A set of strings associated with this server. Each tag is a free form
+  // string. The admin may use these tags during the model assignment.
+  repeated string tags = 4;
 }
 
 message ModelServerTypeStat {
@@ -165,9 +175,15 @@ message JoinedModelServer {
   ModelServer model_server = 1;
   string address = 2;
   string debug_address = 6;
+  string data_address = 7;
   int64 last_join_ms = 3;                      // milliseconds since Unix epoch
   map<string, ModelStatus> loaded_models = 4;  // model ID: status
   map<string, string> failure_reasons = 5;     // model ID: error message
+
+  // stats
+  float errors_per_second = 8;
+  float successes_per_second = 9;
+  float mean_latency_in_seconds = 10;
 }
 
 message PublishRequest {
@@ -204,6 +220,11 @@ message StatsRequest {
 
 message StatsResponse {
   repeated ModelServerTypeStat model_server_type_stats = 1;
+
+  // This counts the maximum number of servers that can be used to serve a
+  // servable model path. Clients can use this field to calculate their expected
+  // serving capacity.
+  map<string, int32> num_servers_by_servable_model_path = 2;
 }
 
 message WatchLocRequest {
@@ -256,8 +277,15 @@ message WaitForReadyResponse {}
 message JoinRequest {
   // The network address and port identifying a model server, e.g.,
   //   [1::2]:8888
+  // An RPC server listens at this address for ModeletService.{Load, Unload,
+  // Status}, etc.
   string address = 1;
+  // If non-empty, the server has a status http server at this address for
+  // diagnosis purpose. Otherwise, uses 'address'.
   string debug_address = 3;
+  // Client connects to server at this address if non-empty. Otherwise, uses
+  // 'address'.
+  string data_address = 4;
   ModelServer model_server = 2;
 }
 

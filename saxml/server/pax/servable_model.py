@@ -143,7 +143,7 @@ class ServableMethod(servable_model.ServableMethod):
     return self._method_params
 
   @property
-  def streamable(self) -> bool:
+  def streamable_output(self) -> bool:
     return False
 
   def get_unpadded_branch_key(self, inputs: NestedNpTensor) -> int:
@@ -204,14 +204,16 @@ class ServableMethod(servable_model.ServableMethod):
       self, inputs: NestedJTensor, mdl_vars: NestedJTensor, prng_key: PRNGKey
   ) -> NestedJTensor:
     k1, k2 = prng_key
-    # `callback_device_index` is determined at server start time so we pass it
-    # to methods asking for it. Methods with host callbacks can use this
-    # argument to run on same host as preprocessing.
+    # `callback_device` is determined at server start time so we pass it to
+    # methods asking for it. Methods with host callbacks can use this argument
+    # to run on same host as preprocessing.
     def method_fn(model, *args, **kwargs):
       method = getattr(model, self._model_fn_name)
       if 'callback_device_index' in inspect.signature(method).parameters:
         return method(*args, **kwargs,
                       callback_device_index=self.callback_device_index)
+      elif 'callback_device' in inspect.signature(method).parameters:
+        return method(*args, **kwargs, callback_device=self.callback_device)
       else:
         return method(*args, **kwargs)
     outputs = self._model.apply(
@@ -222,6 +224,7 @@ class ServableMethod(servable_model.ServableMethod):
             base_layer.NON_TRAINABLE,
             base_layer.DECODE_CACHE,
             base_layer.PREFIX_DECODE_CACHE,
+            base_layer.INTERMEDIATES,
         ],
         rngs={
             base_layer.PARAMS: k1,
@@ -646,7 +649,10 @@ class ServableModel(servable_model.ServableModel):
           mdl_vars=mdl_vars,
           mdl_var_pspecs=mdl_var_pspecs,
           mdl_var_unpadded_shapes=mdl_var_unpadded_shapes,
-          input_prefetch=self._ckpt_type == CheckpointType.GDA,
+          input_prefetch=(
+              self._ckpt_type
+              in (CheckpointType.GDA, CheckpointType.PERSISTENCE)
+          ),
           precompile=precompile,
           step=step,
       )

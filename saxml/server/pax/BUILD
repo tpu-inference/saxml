@@ -28,7 +28,7 @@ pytype_strict_library(
     name = "branch_selection",
     srcs = ["branch_selection.py"],
     srcs_version = "PY3",
-    visibility = ["//saxml:internal"],
+    visibility = ["//visibility:public"],
     deps = [
         "//third_party/py/numpy",
         "//third_party/py/tensorflow:tensorflow_no_contrib",
@@ -44,6 +44,7 @@ py_strict_test(
     deps = [
         ":branch_selection",
         "//third_party/py/absl-py/testing:absltest",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
     ],
 )
 
@@ -116,13 +117,14 @@ py_strict_test(
     srcs = ["quantization_test.py"],
     deps = [
         ":quantization",
-        "//saxml/server/pax/lm/params:lm_cloud",
         "//third_party/py/absl-py/testing:absltest",
         "//third_party/py/absl-py/testing:parameterized",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
         "//third_party/py/praxis:test_utils",
         "//third_party/py/praxis/layers",
         "//third_party/py/praxis/layers/quantization:layers",
         "//third_party/py/praxis/layers/quantization:quantization_hparams",
+        "//saxml/server/pax/lm/params:lm_cloud",
     ],
 )
 

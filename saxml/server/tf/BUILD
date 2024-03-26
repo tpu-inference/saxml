@@ -29,6 +29,7 @@ py_strict_test(
     deps = [
         ":np_tf_sess_wrapper",
         "//third_party/py/absl-py/testing:absltest",
+        # Unused internal protobuf deps,  # Automatically added go/proto_python_upb_flip
         "//third_party/py/numpy",
         "//third_party/py/tensorflow:tensorflow_no_contrib",
     ],
@@ -57,8 +58,11 @@ pybind_extension(
         "@org_tensorflow//tensorflow/core/kernels:reduce_join_op",
         "@org_tensorflow//tensorflow/core/kernels:required",
         "@org_tensorflow//tensorflow/core/kernels:state",
+        "@org_tensorflow//tensorflow/core/kernels:string_join_op",
+        "@org_tensorflow//tensorflow/core/kernels:string_length_op",
         "@org_tensorflow//tensorflow/core/kernels:string_split_op",
         "@org_tensorflow//tensorflow/core/kernels:string_to_number_op",
+        "@org_tensorflow//tensorflow/core/kernels:substr_op",
         "@org_tensorflow//tensorflow/core/kernels:unsorted_segment_join_op",
         "@org_tensorflow//tensorflow/core/ops",
         "@org_tensorflow//tensorflow/core/platform:status",

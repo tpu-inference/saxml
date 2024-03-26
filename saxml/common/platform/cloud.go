@@ -193,6 +193,11 @@ func (e *Env) Init(ctx context.Context) {
 	flag.Parse()
 }
 
+// InTest returns whether the process is running in a test.
+func (e *Env) InTest(ctx context.Context) bool {
+	return strings.Contains(os.Args[0], "_test")
+}
+
 // ReadFile reads the content of a file.
 func (e *Env) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	if strings.HasPrefix(path, gcsPathPrefix) {
@@ -218,7 +223,10 @@ func (e *Env) ReadCachedFile(ctx context.Context, path string) ([]byte, error) {
 }
 
 // WriteFile writes the content of a file.
-func (e *Env) WriteFile(ctx context.Context, path string, data []byte) error {
+func (e *Env) WriteFile(ctx context.Context, path, writeACL string, data []byte) error {
+	if writeACL != "" {
+		log.Warningf("Ignoring file write ACL: %s", writeACL)
+	}
 	if strings.HasPrefix(path, gcsPathPrefix) {
 		_, object, err := gcsBucketAndObject(ctx, path)
 		if err != nil {
@@ -238,7 +246,7 @@ func (e *Env) WriteFile(ctx context.Context, path string, data []byte) error {
 // WriteFileAtomically writes the content of a file safety to file systems without versioning.
 func (e *Env) WriteFileAtomically(ctx context.Context, path string, data []byte) error {
 	if strings.HasPrefix(path, gcsPathPrefix) {
-		return e.WriteFile(ctx, path, data)
+		return e.WriteFile(ctx, path, "", data)
 	}
 
 	// Write to a temp file first and then rename, to reduce the risk of corrupted files.
@@ -286,7 +294,7 @@ func (e *Env) FileExists(ctx context.Context, path string) (bool, error) {
 // On Cloud, this can be either a local file system path (e.g. /home/user/sax-root/) or a Google
 // Cloud Storage URL (e.g. gs://bucket/sax-root/). Note the trailing slash is required.
 func (e *Env) RootDir(ctx context.Context) string {
-	if strings.Contains(os.Args[0], "_test") {
+	if e.InTest(ctx) {
 		return testRoot
 	}
 	if *saxRoot != "" {
@@ -322,9 +330,9 @@ func (e *Env) FsRootDir(fsRoot string) string {
 }
 
 // CreateDir creates a directory.
-func (e *Env) CreateDir(ctx context.Context, path, acl string) error {
-	if acl != "" {
-		return fmt.Errorf("CreateDir with ACL is not supported: %w", errors.ErrUnimplemented)
+func (e *Env) CreateDir(ctx context.Context, path, writeACL string) error {
+	if writeACL != "" {
+		log.Warningf("Ignoring directory write ACL: %s", writeACL)
 	}
 	if strings.HasPrefix(path, gcsPathPrefix) {
 		_, object, err := gcsBucketAndObject(ctx, filepath.Join(path, metadataFile))
@@ -337,6 +345,11 @@ func (e *Env) CreateDir(ctx context.Context, path, acl string) error {
 	}
 
 	return os.MkdirAll(path, 0777)
+}
+
+// DeleteDir deletes a directory.
+func (e *Env) DeleteDir(ctx context.Context, path string) error {
+	return fmt.Errorf("DeleteDir on %s is not supported: %w", path, errors.ErrUnimplemented)
 }
 
 // ListSubdirs lists subdirectories in a directory.
@@ -409,7 +422,7 @@ func (e *Env) DirExists(ctx context.Context, path string) (bool, error) {
 func (e *Env) CheckACLs(principal string, acls []string) error {
 	for _, acl := range acls {
 		if acl != "" {
-			return fmt.Errorf("ACL check is not supported: %w", errors.ErrUnimplemented)
+			log.Warningf("Ignoring ACL: %s", acl)
 		}
 	}
 	return nil
@@ -528,20 +541,20 @@ func (s *Server) GRPCServer() *grpc.Server {
 func (s *Server) CheckACLs(ctx context.Context, acls []string) error {
 	for _, acl := range acls {
 		if acl != "" {
-			return fmt.Errorf("ACL check is not supported: %w", errors.ErrUnimplemented)
+			log.Warningf("Ignoring ACL: %s", acl)
 		}
 	}
 	return nil
 }
 
-func modelTableRows(models []*pb.PublishedModel) []tmplModelTableRow {
+func modelTableRows(models []*env.ModelInfo) []tmplModelTableRow {
 	var items []tmplModelTableRow
 	for _, model := range models {
-		id := model.GetModel().GetModelId()
-		path := model.GetModel().GetModelPath()
-		ckpt := model.GetModel().GetCheckpointPath()
-		requested := fmt.Sprintf("%v", model.GetModel().GetRequestedNumReplicas())
-		assigned := fmt.Sprintf("%v", len(model.GetModeletAddresses()))
+		id := model.Model.GetModel().GetModelId()
+		path := model.Model.GetModel().GetModelPath()
+		ckpt := model.Model.GetModel().GetCheckpointPath()
+		requested := fmt.Sprintf("%v", model.Model.GetModel().GetRequestedNumReplicas())
+		assigned := fmt.Sprintf("%v", len(model.Model.GetModeletAddresses()))
 		items = append(items, tmplModelTableRow{id, requested, assigned, path, ckpt})
 	}
 	return items
@@ -583,7 +596,7 @@ func (s *Server) WriteStatusPage(w http.ResponseWriter, data *env.StatusPageData
 		if len(data.Models) != 1 {
 			return fmt.Errorf("want 1 model, got %v", len(data.Models))
 		}
-		tmplData.ModelTableHeader = "Model " + data.Models[0].GetModel().GetModelId()
+		tmplData.ModelTableHeader = "Model " + data.Models[0].Model.GetModel().GetModelId()
 		tmplData.ServerTableHeader = "Servers"
 	case env.ServerStatusPage:
 		tmplData.PageHeader = data.SaxCell + " Server Status"
@@ -599,7 +612,7 @@ func (s *Server) WriteStatusPage(w http.ResponseWriter, data *env.StatusPageData
 }
 
 // NewServer creates a gRPC server.
-func (e *Env) NewServer() (env.Server, error) {
+func (e *Env) NewServer(ctx context.Context) (env.Server, error) {
 	s := &Server{grpc.NewServer()}
 	reflection.Register(s.GRPCServer())
 	return s, nil

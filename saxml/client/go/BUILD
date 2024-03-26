@@ -40,6 +40,7 @@ go_library(
         # unused internal multimodal gRPC dependency,
         "//saxml/protobuf:vision_go_proto_grpc",
         # unused internal vision gRPC dependency,
+        "@com_github_cenkalti_backoff//:go_default_library",
         "@com_github_golang_glog//:go_default_library",
         "@org_golang_google_grpc//:go_default_library",
         "@org_golang_google_grpc//metadata:go_default_library",
@@ -55,6 +56,7 @@ go_library(
         "//saxml/common/platform:env",
         "@com_github_golang_glog//:go_default_library",
         "@org_golang_google_grpc//:go_default_library",
+        "@org_golang_google_grpc//connectivity:go_default_library",
     ],
 )
 
@@ -78,11 +80,7 @@ go_test(
 go_library(
     name = "location",
     srcs = ["location.go"],
-    deps = [
-        ":saxadmin",
-        "//saxml/common:errors",
-        "@com_github_golang_glog//:go_default_library",
-    ],
+    deps = [":saxadmin"],
 )
 
 go_library(
@@ -92,6 +90,7 @@ go_library(
         "//saxml/common:addr",
         "//saxml/common:errors",
         "//saxml/common:retrier",
+        "//saxml/common:skiplist",
         "//saxml/common:watchable",
         "//saxml/common/platform:env",
         "//saxml/protobuf:admin_go_proto_grpc",
@@ -99,4 +98,11 @@ go_library(
         "@com_github_golang_glog//:go_default_library",
         "@org_golang_google_grpc//:go_default_library",
     ],
+)
+
+go_test(
+    name = "saxadmin_test",
+    srcs = ["admin_test.go"],
+    library = ":saxadmin",
+    deps = ["//saxml/common:errors"],
 )

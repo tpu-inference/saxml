@@ -157,7 +157,24 @@ func (v *VisionModel) Embed(ctx context.Context, imageBytes []byte, options ...M
 	return resp.GetEmbedding(), nil
 }
 
+// BoundingBox represents a single bounding box.
+type BoundingBox struct {
+	CenterX float64 // Center of the box in x-axis.
+	CenterY float64 // Center of the box in y-axis.
+	Width   float64 // Width of the box.
+	Height  float64 // Height of the box.
+}
+
+// DetectionMask contains a representation for a single mask.
+type DetectionMask struct {
+	Height     int32
+	Width      int32
+	MaskValues []byte
+}
+
 // DetectResult contains a representation for a single bounding box.
+// All fields should be set except for Mask which is optional.
+// When the mask is empty, the following holds: Height == 0, Width == 0, len(MaskValues) == 0.
 type DetectResult struct {
 	CenterX float64
 	CenterY float64
@@ -165,24 +182,45 @@ type DetectResult struct {
 	Height  float64
 	Text    string
 	Score   float64
+	Mask    DetectionMask
 }
 
-func extractBoundingBox(res *pb.DetectResponse) []DetectResult {
+func insertBoundingBoxes(boxes []BoundingBox, req *pb.DetectRequest) {
+	var boxesOfInterest []*pb.BoundingBox
+	for _, box := range boxes {
+		boxesOfInterest = append(boxesOfInterest, &pb.BoundingBox{
+			Cx: box.CenterX,
+			Cy: box.CenterY,
+			W:  box.Width,
+			H:  box.Height,
+		})
+	}
+	req.BoxesOfInterest = boxesOfInterest
+}
+
+func extractBoundingBoxes(res *pb.DetectResponse) []DetectResult {
 	var result []DetectResult
 	for _, one := range res.GetBoundingBoxes() {
+		mask := DetectionMask{
+			Height:     one.GetMask().GetMaskHeight(),
+			Width:      one.GetMask().GetMaskWidth(),
+			MaskValues: one.GetMask().GetMaskValues(),
+		}
 		candidate := DetectResult{
 			CenterX: one.GetCx(),
 			CenterY: one.GetCy(),
 			Width:   one.GetW(),
 			Height:  one.GetH(),
 			Text:    one.GetText(),
-			Score:   one.GetScore()}
+			Score:   one.GetScore(),
+			Mask:    mask}
 		result = append(result, candidate)
 	}
 	return result
 }
 
-func (v *VisionModel) Detect(ctx context.Context, imageBytes []byte, text []string, options ...ModelOptionSetter) ([]DetectResult, error) {
+// Detect performs detection for a serialized image (`imageBytes`) against a vision model.
+func (v *VisionModel) Detect(ctx context.Context, imageBytes []byte, text []string, boxes []BoundingBox, options ...ModelOptionSetter) ([]DetectResult, error) {
 	opts := NewModelOptions(options...)
 	req := &pb.DetectRequest{
 		ModelKey:    v.model.modelID,
@@ -190,6 +228,7 @@ func (v *VisionModel) Detect(ctx context.Context, imageBytes []byte, text []stri
 		Text:        text,
 		ExtraInputs: opts.ExtraInputs(),
 	}
+	insertBoundingBoxes(boxes, req)
 
 	var resp *pb.DetectResponse
 	err := v.model.run(ctx, "Detect", func(conn *grpc.ClientConn) error {
@@ -200,7 +239,7 @@ func (v *VisionModel) Detect(ctx context.Context, imageBytes []byte, text []stri
 	if err != nil {
 		return nil, err
 	}
-	res := extractBoundingBox(resp)
+	res := extractBoundingBoxes(resp)
 	return res, nil
 }
 

@@ -139,6 +139,7 @@ go_library(
     srcs = ["config.go"],
     deps = [
         ":cell",
+        ":errors",
         "//saxml/common/platform:env",
         "//saxml/protobuf:admin_go_proto_grpc",
         "@com_github_golang_glog//:go_default_library",
@@ -223,6 +224,7 @@ go_library(
         "//saxml/protobuf:vision_go_proto_grpc",
         # unused internal vision gRPC dependency,
         "@com_github_golang_glog//:go_default_library",
+        "@org_golang_google_protobuf//proto",
     ],
 )
 
@@ -274,4 +276,15 @@ go_library(
 go_library(
     name = "eventlog",
     srcs = ["eventlog.go"],
+)
+
+go_library(
+    name = "skiplist",
+    srcs = ["skiplist.go"],
+)
+
+go_test(
+    name = "skiplist_test",
+    srcs = ["skiplist_test.go"],
+    library = ":skiplist",
 )

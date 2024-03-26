@@ -65,9 +65,11 @@ go_library(
     name = "mgr",
     srcs = ["mgr.go"],
     deps = [
+        ":assigner",
         ":protobuf",
         ":state",
         ":validator",
+        # unused internal flag dependency,
         "//saxml/common:errors",
         "//saxml/common:eventlog",
         "//saxml/common:naming",
@@ -103,5 +105,46 @@ go_library(
         "//saxml/protobuf:common_go_proto",
         "@com_github_golang_glog//:go_default_library",
         "@org_golang_google_protobuf//encoding/prototext",
+    ],
+)
+
+go_library(
+    name = "assigner",
+    srcs = ["assigner.go"],
+    deps = [
+        ":protobuf",
+        ":utils",
+        "//saxml/common:naming",
+        "//saxml/protobuf:admin_go_proto_grpc",
+    ],
+)
+
+go_test(
+    name = "assigner_test",
+    srcs = ["assigner_test.go"],
+    library = ":assigner",
+    deps = [
+        ":protobuf",
+        "//saxml/common:naming",
+    ],
+)
+
+go_library(
+    name = "utils",
+    srcs = ["utils.go"],
+    deps = [
+        ":protobuf",
+        "//saxml/protobuf:admin_go_proto_grpc",
+        "@com_github_golang_glog//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "utils_test",
+    srcs = ["utils_test.go"],
+    library = ":utils",
+    deps = [
+        ":protobuf",
+        "//saxml/protobuf:admin_go_proto_grpc",
     ],
 )

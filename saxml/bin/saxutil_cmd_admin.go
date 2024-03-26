@@ -17,15 +17,14 @@ package saxcommand
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"flag"
 	log "github.com/golang/glog"
@@ -35,32 +34,30 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"saxml/admin/validator"
 	"saxml/client/go/saxadmin"
+	"saxml/common/addr"
 	"saxml/common/cell"
 	"saxml/common/config"
 	"saxml/common/naming"
+	"saxml/common/platform/env"
 	"saxml/common/watchable"
 
 	apb "saxml/protobuf/admin_go_proto_grpc"
 	cpb "saxml/protobuf/common_go_proto"
 )
 
-var (
-	cmdTimeout = flag.Duration("sax_timeout", 60*time.Second, "How many seconds to wait for command completion.")
-)
-
-// CreateCmd is the command for Create.
+// CreateCmd creates a new Sax cell.
 type CreateCmd struct{}
 
 // Name returns the name of CreateCmd.
 func (*CreateCmd) Name() string { return "create" }
 
 // Synopsis returns the synopsis of CreateCmd.
-func (*CreateCmd) Synopsis() string { return "create a SAX cell." }
+func (*CreateCmd) Synopsis() string { return "Create a Sax cell." }
 
 // Usage returns the full usage of CreateCmd.
 func (*CreateCmd) Usage() string {
-	return `create <cell name> <file system path> [admin ACL string]:
-	Create a SAX cell and initialize its state.
+	return `create <cell name> <file system path> <admin ACL string>:
+	Create a Sax cell and initialize its state.
 `
 }
 
@@ -69,25 +66,102 @@ func (c *CreateCmd) SetFlags(f *flag.FlagSet) {}
 
 // Execute executes CreateCmd.
 func (c *CreateCmd) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
-	if len(f.Args()) != 2 && len(f.Args()) != 3 {
-		log.Errorf("Provide a SAX cell name (e.g. /sax/bar), a file system path for persistence (e.g. gs://bucket/path), and an optional admin ACL string.")
+	if len(f.Args()) != 3 {
+		log.Errorf("Provide a Sax cell name (e.g. /sax/bar), a file system path for persistence (e.g. gs://bucket/path), and an admin ACL string.")
 		return subcommands.ExitUsageError
 	}
 	saxCell := f.Args()[0]
 	fsRoot := f.Args()[1]
-	var adminACL string
-	if len(f.Args()) == 3 {
-		adminACL = f.Args()[2]
-	}
-
-	// adminACL, if non-empty, is set as the write ACL on the created cell subdirectory.
-	// All files created within will inherit this ACL as writer.
-	if err := cell.Create(ctx, saxCell, adminACL); err != nil {
-		log.Errorf("Failed to create SAX cell %s: %v", saxCell, err)
+	adminACL := f.Args()[2]
+	if adminACL == "" {
+		log.Errorf("Provide a non-empty admin ACL string.")
 		return subcommands.ExitFailure
 	}
+
+	if err := cell.Exists(ctx, saxCell); err == nil {
+		log.Errorf("Sax cell %s already exists.", saxCell)
+		return subcommands.ExitFailure
+	}
+
+	// adminACL is set as the write ACL on the created cell subdirectory.
+	if err := cell.Create(ctx, saxCell, adminACL); err != nil {
+		log.Errorf("Failed to create Sax cell %s: %v", saxCell, err)
+		return subcommands.ExitFailure
+	}
+	// adminACL is set as the write ACL and the AdminAcl field content of config.proto.
 	if err := config.Create(ctx, saxCell, fsRoot, adminACL); err != nil {
 		log.Errorf("Failed to create config %s: %v", saxCell, err)
+		return subcommands.ExitFailure
+	}
+	// Write a dummy message to location.proto for users who never ran an admin cell in a newly
+	// created cell. adminACL is set as the write ACL on location.proto.
+	path, err := cell.Path(ctx, saxCell)
+	if err != nil {
+		log.Errorf("Failed to get path for Sax cell %s: %v", saxCell, err)
+		return subcommands.ExitFailure
+	}
+	fname := filepath.Join(path, addr.LocationFile)
+	location := &apb.Location{Location: addr.LocationFileInitialContent}
+	content, err := proto.Marshal(location)
+	if err != nil {
+		log.Errorf("Failed to marshal location: %v", err)
+		return subcommands.ExitFailure
+	}
+	if err := env.Get().WriteFile(ctx, fname, adminACL, content); err != nil {
+		log.Errorf("Failed to write location file: %v", err)
+		return subcommands.ExitFailure
+	}
+
+	return subcommands.ExitSuccess
+}
+
+// DeleteCmd deletes an existing Sax cell.
+type DeleteCmd struct{}
+
+// Name returns the name of DeleteCmd.
+func (*DeleteCmd) Name() string { return "delete" }
+
+// Synopsis returns the synopsis of DeleteCmd.
+func (*DeleteCmd) Synopsis() string { return "Delete a Sax cell." }
+
+// Usage returns the full usage of DeleteCmd.
+func (*DeleteCmd) Usage() string {
+	return `delete <cell name>:
+	Delete a Sax cell.
+`
+}
+
+// SetFlags sets flags for DeleteCmd.
+func (c *DeleteCmd) SetFlags(f *flag.FlagSet) {}
+
+// Execute executes DeleteCmd.
+func (c *DeleteCmd) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	if len(f.Args()) != 1 {
+		log.Errorf("Provide a Sax cell name (e.g. /sax/bar).")
+		return subcommands.ExitUsageError
+	}
+	saxCell := f.Args()[0]
+
+	fmt.Printf("Are you sure you want to delete %s? [y|n]: ", saxCell)
+	var input string
+	_, err := fmt.Scanln(&input)
+	if err != nil {
+		log.Errorf("Failed to read input: %v", err)
+		return subcommands.ExitFailure
+	}
+	input = strings.ToLower(input)
+	if input != "y" && input != "yes" {
+		log.Error("Deletion canceled")
+		return subcommands.ExitFailure
+	}
+
+	if err := cell.Exists(ctx, saxCell); err != nil {
+		log.Errorf("Sax cell %s does not exist: %v.", saxCell, err)
+		return subcommands.ExitFailure
+	}
+
+	if err := cell.Delete(ctx, saxCell); err != nil {
+		log.Errorf("Failed to delete Sax cell %s: %v", saxCell, err)
 		return subcommands.ExitFailure
 	}
 
@@ -158,12 +232,12 @@ type ListCmd struct {
 func (*ListCmd) Name() string { return "ls" }
 
 // Synopsis returns the synopsis of ListCmd.
-func (*ListCmd) Synopsis() string { return "list published models" }
+func (*ListCmd) Synopsis() string { return "List published models." }
 
 // Usage returns the full usage of ListCmd.
 func (*ListCmd) Usage() string {
 	return `ls /sax[/cell[/model]]:
-	List all sax cells, models in a cell, or information of a model.
+	List all Sax cells, models in a cell, or information of a model.
 `
 }
 
@@ -292,7 +366,7 @@ type PublishCmd struct {
 func (*PublishCmd) Name() string { return "publish" }
 
 // Synopsis returns the synopsis of PublishCmd.
-func (*PublishCmd) Synopsis() string { return "publish a model" }
+func (*PublishCmd) Synopsis() string { return "Publish a model." }
 
 // Usage returns the full usage of PublishCmd.
 func (*PublishCmd) Usage() string {
@@ -332,17 +406,12 @@ func (c *PublishCmd) Execute(ctx context.Context, f *flag.FlagSet, args ...any) 
 
 	overrides := make(map[string]string)
 	for _, item := range f.Args()[4:] {
-		parts := strings.Split(item, "=")
-		if len(parts) != 2 {
+		key, val, found := strings.Cut(item, "=")
+		if !found {
 			log.Errorf("Overrides should be of the form key=val")
 			return subcommands.ExitUsageError
 		}
-		var parsedValue any
-		if err := json.Unmarshal([]byte(parts[1]), &parsedValue); err != nil {
-			log.Errorf("Override value is not a valid JSON: %v", err)
-			return subcommands.ExitUsageError
-		}
-		overrides[parts[0]] = parts[1]
+		overrides[key] = val
 	}
 
 	admin := saxadmin.Open(modelID.CellFullName())
@@ -364,7 +433,7 @@ type UnpublishCmd struct{}
 func (*UnpublishCmd) Name() string { return "unpublish" }
 
 // Synopsis returns the synopsis of UnpublishCmd.
-func (*UnpublishCmd) Synopsis() string { return "unpublish a model" }
+func (*UnpublishCmd) Synopsis() string { return "Unpublish a model." }
 
 // Usage returns the full usage of UnpublishCmd.
 func (*UnpublishCmd) Usage() string {
@@ -409,7 +478,7 @@ type UpdateCmd struct {
 func (*UpdateCmd) Name() string { return "update" }
 
 // Synopsis returns the synopsis of UpdateCmd.
-func (*UpdateCmd) Synopsis() string { return "update a model" }
+func (*UpdateCmd) Synopsis() string { return "Update a model." }
 
 // Usage returns the full usage of UpdateCmd.
 func (*UpdateCmd) Usage() string {
@@ -470,7 +539,7 @@ type SetACLCmd struct{}
 func (*SetACLCmd) Name() string { return "setacl" }
 
 // Synopsis returns the synopsis of SetACLCmd.
-func (*SetACLCmd) Synopsis() string { return "set ACLs for a cell or model" }
+func (*SetACLCmd) Synopsis() string { return "Set ACLs for a cell or model." }
 
 // Usage returns the full usage of SetACLCmd.
 func (*SetACLCmd) Usage() string {
@@ -496,15 +565,16 @@ func (c *SetACLCmd) handleSaxCell(ctx context.Context, cellFullName naming.CellF
 	}
 	log.Infof("Current config definition:\n%v", cfg)
 
+	adminACL := args[1]
 	change := proto.Clone(cfg).(*apb.Config)
-	change.AdminAcl = args[1]
+	change.AdminAcl = adminACL
 	log.Infof("Updated config definition:\n%v", change)
 
 	if err := validator.ValidateConfigUpdate(cfg, change); err != nil {
 		log.Errorf("Invalid config update: %v", err)
 		return subcommands.ExitFailure
 	}
-	if err := config.Save(ctx, change, saxCell); err != nil {
+	if err := config.Save(ctx, change, saxCell, adminACL); err != nil {
 		log.Errorf("Failed to save config: %v", err)
 		return subcommands.ExitFailure
 	}
@@ -591,7 +661,7 @@ type GetACLCmd struct{}
 func (*GetACLCmd) Name() string { return "getacl" }
 
 // Synopsis returns the synopsis of GetACLCmd.
-func (*GetACLCmd) Synopsis() string { return "get ACLs for a cell or model" }
+func (*GetACLCmd) Synopsis() string { return "Get ACLs for a cell or model." }
 
 // Usage returns the full usage of GetACLCmd.
 func (*GetACLCmd) Usage() string {
@@ -704,7 +774,7 @@ type WatchCmd struct{}
 func (*WatchCmd) Name() string { return "watch" }
 
 // Synopsis returns the synopsis of WatchCmd.
-func (*WatchCmd) Synopsis() string { return "watch addresses of a model" }
+func (*WatchCmd) Synopsis() string { return "Watch addresses of a model." }
 
 // Usage returns the full usage of WatchCmd.
 func (*WatchCmd) Usage() string {
@@ -730,6 +800,7 @@ func (c *WatchCmd) Execute(ctx context.Context, f *flag.FlagSet, args ...any) su
 
 	admin := saxadmin.Open(modelID.CellFullName())
 	ch := make(chan *saxadmin.WatchResult)
+	// The Watch command intentionally doesn't have a timeout.
 	go admin.WatchAddresses(ctx, modelID.ModelFullName(), ch)
 	for {
 		wr := <-ch

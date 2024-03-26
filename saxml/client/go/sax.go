@@ -24,6 +24,7 @@ import (
 	"time"
 
 	log "github.com/golang/glog"
+	"github.com/cenkalti/backoff"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"saxml/client/go/connection"
@@ -65,16 +66,15 @@ type QueryCost struct {
 // `callMethod` is the callback function that performs model logic (e.g. score, sample).
 func (m *Model) run(ctx context.Context, methodName string, callMethod func(conn *grpc.ClientConn) error) error {
 	makeQuery := func() error {
-		modelServerConn, address, err := m.connectionFactory.GetOrCreate(ctx)
+		modelServerConn, err := m.connectionFactory.GetOrCreate(ctx)
 		if err == nil {
 			err = callMethod(modelServerConn)
-		}
-		if errors.ServerShouldPoison(err) {
-			m.connectionFactory.Poison(address)
+		} else if errors.IsNotFound(err) {
+			// If the model does not exist anymore, no point to retry.
+			err = backoff.Permanent(err)
 		}
 		return err
 	}
-
 	err := retrier.Do(ctx, makeQuery, m.retryingBehavior)
 	if err != nil {
 		log.V(1).Infof("%s() failed: %s", methodName, err)
@@ -231,12 +231,12 @@ func NewModelOptions(setters ...ModelOptionSetter) *ModelOptions {
 }
 
 // StartDebugPort starts a http server at `port` to get debug information.
-func StartDebugPort(port int) {
+func StartDebugPort(ctx context.Context, port int) {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		log.Fatalf("Debug port %d failed", port)
 	}
-	gRPCServer, err := env.Get().NewServer()
+	gRPCServer, err := env.Get().NewServer(ctx)
 	if err != nil {
 		log.Fatalf("Debug grpc server at port %d failed", port)
 	}
@@ -251,7 +251,7 @@ func StartDebugPort(port int) {
 func Open(id string, options ...OptionSetter) (*Model, error) {
 	// Default options.
 	opts := &Options{
-		numConn: 3,
+		numConn: 37,
 	}
 	for _, s := range options {
 		s(opts)

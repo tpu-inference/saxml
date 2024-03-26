@@ -19,6 +19,9 @@
 #ifndef SAXML_CLIENT_PYTHON_WRAPPER_H_
 #define SAXML_CLIENT_PYTHON_WRAPPER_H_
 
+#include <cstdint>
+#include <map>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -141,6 +144,12 @@ class MultimodalModel {
       const ::sax::server::multimodal::GenerateRequest& request,
       const ModelOptions* options = nullptr) const;
 
+  // Invokes the model to score given 'ScoreRequest.prefix_items' and
+  // 'ScoreRequest.suffix_items'.
+  absl::StatusOr<::sax::server::multimodal::ScoreResponse> Score(
+      const ::sax::server::multimodal::ScoreRequest& request,
+      const ModelOptions* options = nullptr) const;
+
  private:
   explicit MultimodalModel(::sax::client::Model* base,
                            const absl::Status& status);
@@ -187,7 +196,8 @@ class VisionModel {
   absl::StatusOr<std::vector<double>> Embed(
       absl::string_view image, const ModelOptions* options = nullptr) const;
 
-  typedef std::tuple<double, double, double, double, pybind11::bytes, double>
+  typedef std::tuple<double, double, double, double, pybind11::bytes, double,
+                     std::tuple<int32_t, int32_t, pybind11::bytes>>
       PyDetectResult;
 
   // Run detection on the given image.
@@ -195,9 +205,11 @@ class VisionModel {
   // For open-set detection models, one can pass text lists as the second
   // argument.
   //
-  // Returns a vector of bounding boxes as a tuple <cx, cy, w, h, text, score>.
+  // Returns a vector of bounding boxes as a tuple <cx, cy, w, h, text, score,
+  // mask>.
   absl::StatusOr<std::vector<PyDetectResult>> Detect(
       absl::string_view image_bytes, std::vector<std::string> text = {},
+      std::vector<std::tuple<double, double, double, double>> boxes = {},
       const ModelOptions* options = nullptr) const;
 
   // ImageToText produces captions given the image bytes and prefix text.
@@ -244,9 +256,11 @@ class Model {
 
 void StartDebugPort(int port);
 
-absl::Status Publish(absl::string_view id, absl::string_view model_path,
-                     absl::string_view checkpoint_path, int num_replicas,
-                     const AdminOptions* options = nullptr);
+absl::Status Publish(
+    absl::string_view id, absl::string_view model_path,
+    absl::string_view checkpoint_path, int num_replicas,
+    std::optional<std::map<std::string, std::string>> overrides,
+    const AdminOptions* options = nullptr);
 
 absl::Status Unpublish(absl::string_view id,
                        const AdminOptions* options = nullptr);

@@ -14,7 +14,7 @@
 """Serving template params."""
 
 import functools
-from typing import Dict, Optional, Sequence, Type, cast
+from typing import Dict, Optional, Sequence, Tuple, Type, cast
 
 import numpy as np
 from paxml import base_task
@@ -23,6 +23,7 @@ from praxis import base_layer
 from praxis import decoder_hparams
 from praxis import pax_fiddle
 from praxis import py_utils
+from praxis import token_samplers
 from praxis.layers import attentions
 from praxis.layers import multi_query_attention
 from praxis.layers import transformer_models
@@ -30,6 +31,7 @@ from praxis.layers import transformers
 from saxml.server import servable_model_registry
 from saxml.server.pax.lm import lm_tokenizer
 from saxml.server.pax.lm import servable_lm_model
+import tensorflow as tf
 
 
 LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
@@ -57,7 +59,7 @@ class CommonServingTemplate:
   USE_TOP_K_FOR_LOGPROBS = False
   BEAM_SIZE = 4
   TOKENS_PER_BEAM = None
-  FPROP_FOR_PREFIX = False
+  FPROP_FOR_PREFIX = True
   GLOBAL_NORMALIZE = False
   VOCAB_SIZE = 32000
   LENGTH_NORM_ALPHA = 0.8
@@ -97,6 +99,15 @@ class CommonServingTemplate:
   GENERATION_USE_GEOMEAN_PROB_SCORE = False
   SCORING_USE_GEOMEAN_PROB_SCORE = False
   SCORING_INCLUDE_EOS_SCORE = False
+
+  # Params for continuous batching.
+  # Setting NUM_CACHE_SLOTS to 0 disables continuous batching.
+  # Only NUM_SAMPLES = 1 is supported.
+  NUM_CACHE_SLOTS = 0  # Batch size for generate.
+
+  NEXT_TOKEN_SAMPLER_TPL = pax_fiddle.Config(
+      token_samplers.DefaultNextTokenSampler
+  )
 
   def input_for_model_init(self) -> py_utils.NestedMap:
     batch_size = self.BATCH_SIZE
@@ -219,6 +230,7 @@ class ServingTemplate(
           eos_id=stop_token_ids,
           decode_loop_mesh_axes_transpose=self.DECODE_MESH_TRANSPOSE,
           emb_lookup_style=self.EMB_LOOKUP_STYLE,
+          num_cache_slots=self.NUM_CACHE_SLOTS,
       )
     else:
       generate_hparams = decoder_hparams.SampleDecoderHParams(
@@ -240,6 +252,8 @@ class ServingTemplate(
           decode_loop_mesh_axes_transpose=self.DECODE_MESH_TRANSPOSE,
           emb_lookup_style=self.EMB_LOOKUP_STYLE,
           sort_samples=self.SORT_SAMPLES,
+          next_token_sampler_tpl=self.NEXT_TOKEN_SAMPLER_TPL,
+          num_cache_slots=self.NUM_CACHE_SLOTS if self.NUM_SAMPLES == 1 else 0,
       )
     return servable_lm_model.DecodeHParams(
         batch_size=self.BATCH_SIZE,
@@ -280,22 +294,40 @@ class ServingTemplate(
         else (self.INPUT_SEQ_LEN + max_decode_steps)
     )
 
-    generate_hparams = decoder_hparams.SampleDecoderHParams(
-        fprop_for_prefix=self.FPROP_FOR_PREFIX,
-        # Use LPB for whenever FPROP_FOR_PREFIX is enabled.
-        lazy_prefix_broadcast=self.FPROP_FOR_PREFIX
-        and self.NUM_SAMPLES > 1
-        and self.SUPPORT_LAZY_PREFIX_BROADCAST,
-        max_decode_steps=self.MAX_DECODE_STEPS,
-        seqlen=seqlen,
-        num_samples=self.NUM_SAMPLES,
-        temperature=None,
-        eos_id=stop_token_ids,
-        k=self.TOP_K,
-        emb_lookup_style=self.EMB_LOOKUP_STYLE,
-        sort_samples=self.SORT_SAMPLES,
-    )
-
+    if self.NUM_SAMPLES == 1 and self.TOP_K == 1 and self.NUM_CACHE_SLOTS > 0:
+      generate_hparams = decoder_hparams.GreedyDecoderHParams(
+          fprop_for_prefix=self.FPROP_FOR_PREFIX,
+          min_decode_steps=self.MIN_DECODE_STEPS,
+          max_decode_steps=self.MAX_DECODE_STEPS,
+          seqlen=seqlen,
+          eos_id=stop_token_ids,
+          decode_loop_mesh_axes_transpose=self.DECODE_MESH_TRANSPOSE,
+          emb_lookup_style=self.EMB_LOOKUP_STYLE,
+          num_cache_slots=self.NUM_CACHE_SLOTS,
+      )
+    else:
+      generate_hparams = decoder_hparams.SampleDecoderHParams(
+          fprop_for_prefix=self.FPROP_FOR_PREFIX,
+          # Use LPB for whenever FPROP_FOR_PREFIX is enabled.
+          lazy_prefix_broadcast=self.FPROP_FOR_PREFIX
+          and self.NUM_SAMPLES > 1
+          and self.SUPPORT_LAZY_PREFIX_BROADCAST,
+          min_decode_steps=self.MIN_DECODE_STEPS,
+          max_decode_steps=self.MAX_DECODE_STEPS,
+          seqlen=seqlen,
+          num_samples=self.NUM_SAMPLES,
+          temperature=0.0,
+          eos_id=stop_token_ids,
+          k=self.TOP_K,
+          top_k_recall_target=self.TOP_K_RECALL_TARGET,
+          use_top_k_for_logprobs=self.USE_TOP_K_FOR_LOGPROBS,
+          global_normalize=self.GLOBAL_NORMALIZE,
+          decode_loop_mesh_axes_transpose=self.DECODE_MESH_TRANSPOSE,
+          emb_lookup_style=self.EMB_LOOKUP_STYLE,
+          sort_samples=self.SORT_SAMPLES,
+          next_token_sampler_tpl=self.NEXT_TOKEN_SAMPLER_TPL,
+          num_cache_slots=self.NUM_CACHE_SLOTS if self.NUM_SAMPLES == 1 else 0,
+      )
     return servable_lm_model.DecodeHParams(
         batch_size=self.BATCH_SIZE,
         polymorphic_seq_len_exclusion=self.POLYMORPHIC_SEQ_LEN_EXCLUSION,
@@ -304,10 +336,12 @@ class ServingTemplate(
         decoder=generate_hparams,
         include_prefix_in_result=self.INCLUDE_PREFIX_IN_RESULT,
         max_live_batches=self.MAX_LIVE_BATCHES,
+        batching_wait_secs=self.BATCH_WAIT_SECS,
         extra_inputs=self.EXTRA_INPUTS,
         extra_inputs_dtypes=self.EXTRA_INPUTS_DTYPES,
         stream_interval_steps=self.STREAM_INTERVAL_STEPS,
         fetch_prefix_lengths_from_inputs=self.FETCH_PREFIX_LENGTHS_FROM_INPUTS,
+        output_geometric_mean_prob_score=self.GENERATION_USE_GEOMEAN_PROB_SCORE,
     )
 
   def text_to_embedding(
@@ -337,6 +371,78 @@ class ServingTemplate(
   def lpb_params_setter(self, lm_tpl: LayerTpl) -> None:
     """Set lazy prefix broadcast params. Allow subclasses to override."""
     set_lazy_prefix_broadcast_params(lm_tpl)
+
+
+class EmbeddingServingTemplate(
+    CommonServingTemplate, servable_lm_model.ServableLMModelParams
+):
+  """Lightweight template servable config for embeddings from gemini."""
+
+  def serving_tokenizer(self):
+    if self.VOCABULARY_CLASS is None:
+      spm_model = (
+          self.SPM_MODEL
+          if self.SPM_MODEL is not None
+          else self._dataset_train().input.tokenizer.spm_model
+      )
+    else:
+      spm_model = None
+
+    return pax_fiddle.Config(
+        lm_tokenizer.LMTokenizer,
+        spm_model=spm_model,
+        target_sos_id=self.SOS_ID,
+        target_eos_id=self.EOS_ID,
+        slice_left=self.SLICE_LEFT,
+        tokenized_input=self.TOKENIZED_INPUT,
+        tokenized_output=self.TOKENIZED_OUTPUT,
+        prepend_sos=self.PREPEND_SOS,
+        eos_padding_and_no_sos=self.EOS_PADDING_AND_NO_SOS,
+        vocabulary_class=self.VOCABULARY_CLASS,
+        vocabulary_path=self.VOCABULARY_PATH,
+    )
+
+  def init_for_serving(self):
+    self._tokenizer = self.serving_tokenizer().Instantiate()
+
+  @tf.function
+  def _tf_tokenize_inputs(
+      self, texts: tf.Tensor, max_length: int
+  ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    ids, labels, paddings = self._tokenizer.StringsToIds(
+        texts, max_length=max_length
+    )
+    weights = 1.0 - paddings
+    return ids, labels, weights, paddings
+
+  def tokenize(
+      self, texts: tf.Tensor, max_length: int
+  ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    return self._tf_tokenize_inputs(texts, max_length)
+
+  def text_to_embedding(
+      self,
+  ) -> Optional[servable_lm_model.TextToEmbeddingHParams]:
+    if (
+        self.GENERATE_ONLY
+        or self.TEXT_TO_EMBEDDING_MODEL_METHOD_NAME is None
+        or self.TEXT_TO_EMBEDDING_OUTPUT_EMBEDDING_NAME is None
+    ):
+      return None
+
+    assert (
+        self.POLYMORPHIC_SEQ_LEN_EXCLUSION is None
+    ), 'This needs to be understood and supported if needed.'
+
+    input_seq_len = self.INPUT_SEQ_LEN - 1
+    return servable_lm_model.TextToEmbeddingHParams(
+        batch_size=self.TEXT_TO_EMBEDDING_SERVING_BATCH_SIZE,
+        max_input_seq_len=input_seq_len,
+        max_live_batches=self.TEXT_TO_EMBEDDING_MAX_LIVE_BATCHES,
+        output_embedding_name=self.TEXT_TO_EMBEDDING_OUTPUT_EMBEDDING_NAME,
+        model_method_name=self.TEXT_TO_EMBEDDING_MODEL_METHOD_NAME,
+        extra_inputs_dtypes=self.EXTRA_INPUTS_DTYPES,
+    )
 
 
 class ServingWithGradientTemplate(ServingTemplate):
@@ -376,7 +482,6 @@ def set_lazy_prefix_broadcast_params(lm_tpl: LayerTpl) -> None:
   xformer = lm_tpl.stacked_transformer_tpl  # pytype: disable=attribute-error  # enable-nested-classes
   if xformer.cls == transformers.StackedTransformerRepeated:
     xformer = xformer.block
-  assert xformer.cls == transformers.StackedTransformer
   layer_ps = xformer.transformer_layer_params_tpl
   lbp_tr_atten_tpl = pax_fiddle.Config(
       attentions.DotProductAttentionWithLPB,
@@ -386,6 +491,7 @@ def set_lazy_prefix_broadcast_params(lm_tpl: LayerTpl) -> None:
   lbp_multi_query_atten_tpl = pax_fiddle.Config(
       mqs_lpb_cls,
   )
+
   def _set_lpb_params_for_layer(layer_p: LayerTpl):
     if issubclass(layer_p.tr_atten_tpl.cls, attentions.DotProductAttention):
       lbp_tr_atten_tpl.copy_fields_from(layer_p.tr_atten_tpl)
@@ -398,6 +504,7 @@ def set_lazy_prefix_broadcast_params(lm_tpl: LayerTpl) -> None:
           'Attention layer does not support lazy prefix broadcast '
           f'{layer_p.tr_atten_tpl.cls}.'
       )
+
   if isinstance(layer_ps, Sequence):
     for layer_p in layer_ps:
       _set_lpb_params_for_layer(layer_p)

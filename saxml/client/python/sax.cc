@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <optional>
 #include <vector>
 
 #include "saxml/client/python/wrapper.h"
@@ -56,12 +57,17 @@ PYBIND11_MODULE(sax, m) {
            &sax::client::ModelOptions::SetExtraInputTensor)
       .def("SetExtraInputString",
            &sax::client::ModelOptions::SetExtraInputString)
+      .def("GetExtraInput", &sax::client::ModelOptions::GetExtraInput)
       .def("GetTimeout", &sax::client::ModelOptions::GetTimeout)
       .def("SetTimeout", &sax::client::ModelOptions::SetTimeout)
       .def("ToDebugString", [](sax::client::ModelOptions& mo) {
         ::sax::ExtraInputs extra_inputs;
         mo.ToProto(&extra_inputs);
         return extra_inputs.DebugString();
+      }).def("ToProto", [](sax::client::ModelOptions& mo) {
+        ::sax::ExtraInputs extra_inputs;
+        mo.ToProto(&extra_inputs);
+        return extra_inputs;
       });
 
   py::class_<sax::client::pybind::AudioModel>(m, "AudioModel")
@@ -140,6 +146,8 @@ PYBIND11_MODULE(sax, m) {
 
   py::class_<sax::client::pybind::MultimodalModel>(m, "MultimodalModel")
       .def("Generate", &sax::client::pybind::MultimodalModel::Generate,
+           py::arg("request"), py::arg("options") = nullptr)
+      .def("Score", &sax::client::pybind::MultimodalModel::Score,
            py::arg("request"), py::arg("options") = nullptr);
 
   py::class_<sax::client::pybind::VisionModel>(m, "VisionModel")
@@ -192,12 +200,16 @@ PYBIND11_MODULE(sax, m) {
           "Detect",
           [](sax::client::pybind::VisionModel& vm,
              absl::string_view image_bytes, std::vector<std::string> text,
+             std::vector<std::tuple<double, double, double, double>> boxes,
              const sax::client::ModelOptions* options)
               -> absl::StatusOr<std::vector<std::tuple<
-                  double, double, double, double, pybind11::bytes, double>>> {
-            return vm.Detect(image_bytes, text, options);
+                  double, double, double, double, pybind11::bytes, double,
+                  std::tuple<int32_t, int32_t, pybind11::bytes>>>> {
+            return vm.Detect(image_bytes, text, boxes, options);
           },
           py::arg("image_bytes"), py::arg("text") = std::vector<std::string>{},
+          py::arg("boxes") =
+              std::vector<std::tuple<double, double, double, double>>{},
           py::arg("options") = nullptr)
       .def(
           "ImageToText",
@@ -247,7 +259,8 @@ PYBIND11_MODULE(sax, m) {
 
   m.def("Publish", &sax::client::pybind::Publish, py::arg("id"),
         py::arg("model_path"), py::arg("checkpoint_path"),
-        py::arg("num_replicas"), py::arg("options") = nullptr);
+        py::arg("num_replicas"), py::arg("overrides") = std::nullopt,
+        py::arg("options") = nullptr);
 
   m.def("Unpublish", &sax::client::pybind::Unpublish, py::arg("id"),
         py::arg("options") = nullptr);

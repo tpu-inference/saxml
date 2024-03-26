@@ -43,10 +43,10 @@ go_library(
     srcs = [
         "saxutil_cmd_admin.go",
         "saxutil_cmd_am.go",
+        "saxutil_cmd_common.go",
         "saxutil_cmd_export.go",
         "saxutil_cmd_lm.go",
         "saxutil_cmd_save.go",
-        "saxutil_cmd_util.go",
         "saxutil_cmd_vm.go",
     ],
     deps = [
@@ -55,10 +55,12 @@ go_library(
         "//saxml/admin:validator",
         "//saxml/client/go:sax",
         "//saxml/client/go:saxadmin",
+        "//saxml/common:addr",
         "//saxml/common:cell",
         "//saxml/common:config",
         "//saxml/common:naming",
         "//saxml/common:watchable",
+        "//saxml/common/platform:env",
         "//saxml/protobuf:admin_go_proto_grpc",
         "//saxml/protobuf:common_go_proto",
         "@com_github_golang_glog//:go_default_library",
@@ -76,6 +78,7 @@ go_binary(
         ":saxcommand",
         "//saxml/common/platform:env",
         "//saxml/common/platform:register",
+        "@com_github_golang_glog//:go_default_library",
         "@com_github_google_subcommands//:go_default_library",
     ],
 )

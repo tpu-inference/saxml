@@ -14,15 +14,16 @@
 
 """Build macros for SAX."""
 
-load("//saxml:saxml.bzl", "pytype_strict_binary")
 load("@com_google_paxml//paxml:build_defs.bzl", "export_binary", "export_sources")
+load("//saxml:saxml.bzl", "pytype_strict_binary")
 
 def create_binary(
         imports_targets = None,
         extra_deps = None,
         name = "",
         main = "",
-        tags = []):
+        tags = [],
+        **kwargs):
     """Macro to define a binary with selected imports.
 
     Args:
@@ -56,6 +57,7 @@ def create_binary(
         # Unused internal paropts
         # Unused internal exec_properties
         tags = tags,
+        **kwargs
     )
 
 def create_server_binary(
@@ -63,7 +65,8 @@ def create_server_binary(
         extra_deps = [],
         name = "server",
         main = "//saxml/server:model_service_main.py",
-        default_deps = ["//saxml/server:server_deps"]):
+        default_deps = ["//saxml/server:server_deps"],
+        use_tpu = False):
     """Macro to define a server binary with selected imports.
 
     Args:
@@ -72,6 +75,9 @@ def create_server_binary(
         //saxml/server:server_deps or imports_targets.
       name: binary name.
     """
+
+    if use_tpu:
+        pass  # Unused internal TPU extra deps
     create_binary(
         imports_targets = imports_targets,
         extra_deps = extra_deps + default_deps,

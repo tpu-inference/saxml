@@ -27,6 +27,7 @@ import (
 
 	log "github.com/golang/glog"
 	// unused internal test dependency
+	"google.golang.org/protobuf/proto"
 	"saxml/common/addr"
 	"saxml/common/cell"
 	"saxml/common/config"
@@ -52,30 +53,34 @@ import (
 	vmgrpc "saxml/protobuf/vision_go_proto_grpc"
 )
 
-// SetUpInternal is exported for the C wrapper.
-func SetUpInternal(ctx context.Context, saxCell string, fsRoot string) error {
+func setUpInternal(ctx context.Context, saxCell string, fsRoot string, adminACL string) error {
 	if err := env.Get().CreateDir(ctx, cell.Sax(ctx), ""); err != nil {
 		return err
 	}
 	if _, err := naming.SaxCellToCell(saxCell); err != nil {
 		return err
 	}
-	if err := cell.Create(ctx, saxCell, ""); err != nil {
+	if err := cell.Create(ctx, saxCell, adminACL); err != nil {
 		return err
 	}
-	if err := config.Create(ctx, saxCell, fsRoot, ""); err != nil {
+	if err := config.Create(ctx, saxCell, fsRoot, adminACL); err != nil {
 		return err
 	}
 	return nil
 }
 
+// SetUpInternal is exported for the C wrapper.
+func SetUpInternal(ctx context.Context, saxCell string, fsRoot string) error {
+	return setUpInternal(ctx, saxCell, fsRoot, "")
+}
+
 // SetUp creates the necessary environment for a given Sax cell name.
 //
 // Tests in the same process should use different Sax cells.
-func SetUp(ctx context.Context, t *testing.T, saxCell string) {
+func SetUp(ctx context.Context, t *testing.T, saxCell string, adminACL string) {
 	t.Helper()
 	fsRoot := t.TempDir()
-	if err := SetUpInternal(ctx, saxCell, fsRoot); err != nil {
+	if err := setUpInternal(ctx, saxCell, fsRoot, adminACL); err != nil {
 		t.Fatalf("SetUp(%v, %v) failed: %v", saxCell, fsRoot, err)
 	}
 }
@@ -179,12 +184,13 @@ func (s *stubAdminServer) Stats(ctx context.Context, in *apb.StatsRequest) (*apb
 // StartStubAdminServer starts a new admin server with stub implementations.
 // Close the returned channel to close the server.
 func StartStubAdminServer(adminPort int, modelPorts []int, saxCell string) (chan struct{}, error) {
+	ctx := context.Background()
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", adminPort))
 	if err != nil {
 		return nil, err
 	}
 
-	gRPCServer, err := env.Get().NewServer()
+	gRPCServer, err := env.Get().NewServer(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +205,7 @@ func StartStubAdminServer(adminPort int, modelPorts []int, saxCell string) (chan
 	}
 	agrpc.RegisterAdminServer(gRPCServer.GRPCServer(), adminServer)
 
-	c, err := addr.SetAddr(context.Background(), adminPort, saxCell)
+	c, err := addr.SetAddr(ctx, adminPort, saxCell)
 	if err != nil {
 		return nil, err
 	}
@@ -600,6 +606,20 @@ type stubCustomModelServer struct{}
 
 func (s *stubCustomModelServer) Custom(ctx context.Context, in *cmpb.CustomRequest) (*cmpb.CustomResponse, error) {
 	text := in.GetRequest()
+	request := &mmpb.GenerateRequest{}
+	err := proto.Unmarshal(text, request)
+	if err == nil {
+		response := &mmpb.GenerateResponse{}
+		response.Results = make([]*mmpb.GenerateResult, len(request.GetItems()))
+		for i, item := range request.GetItems() {
+			response.Results[i] = &mmpb.GenerateResult{
+				Items: []*mmpb.DataItem{item},
+				Score: float64(i) * 2,
+			}
+		}
+		data, _ := proto.Marshal(response)
+		return &cmpb.CustomResponse{Response: data}, nil
+	}
 	return &cmpb.CustomResponse{
 		Response: append(text, []byte("_1")...),
 	}, nil
@@ -636,12 +656,13 @@ func (m *stubMultimodalModelServer) Score(ctx context.Context, in *mmpb.ScoreRpc
 // also runs a modelet service.
 // Close the returned channel to close the server.
 func StartStubModelServer(modelType ModelType, modelPort int, scoreDelay time.Duration, unavailableModel string, loadDelay time.Duration) (chan struct{}, error) {
+	ctx := context.Background()
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", modelPort))
 	if err != nil {
 		return nil, err
 	}
 
-	gRPCServer, err := env.Get().NewServer()
+	gRPCServer, err := env.Get().NewServer(ctx)
 	if err != nil {
 		return nil, err
 	}

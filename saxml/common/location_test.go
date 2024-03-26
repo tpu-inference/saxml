@@ -37,7 +37,7 @@ import (
 func TestSetFetchAddr(t *testing.T) {
 	ctx := context.Background()
 	saxCell := "/sax/test-addr"
-	testutil.SetUp(ctx, t, saxCell)
+	testutil.SetUp(ctx, t, saxCell, "")
 
 	port := 10000
 	c, err := addr.SetAddr(ctx, port, saxCell)
@@ -59,7 +59,7 @@ func TestSetFetchAddr(t *testing.T) {
 func TestJoin(t *testing.T) {
 	ctx := context.Background()
 	saxCell := "/sax/test-join"
-	testutil.SetUp(ctx, t, saxCell)
+	testutil.SetUp(ctx, t, saxCell, "")
 
 	// Start an admin server.
 	port, err := env.Get().PickUnusedPort()
@@ -74,7 +74,7 @@ func TestJoin(t *testing.T) {
 		ChipType:     pb.ModelServer_CHIP_TYPE_TPU_V4,
 		ChipTopology: pb.ModelServer_CHIP_TOPOLOGY_2X2,
 	}
-	if err := location.Join(ctx, saxCell, modelAddr, "", specs, 0); err != nil {
+	if err := location.Join(ctx, saxCell, modelAddr, "", "", specs, 0); err != nil {
 		t.Fatalf("Join(%s) error %v, want no error", saxCell, err)
 	}
 
@@ -100,7 +100,7 @@ func TestJoin(t *testing.T) {
 func TestJoinEmptyCell(t *testing.T) {
 	ctx := context.Background()
 	saxCell := "/sax/test-join-empty"
-	testutil.SetUp(ctx, t, saxCell)
+	testutil.SetUp(ctx, t, saxCell, "")
 
 	// Start the address watcher.
 	modelAddr := "localhost:10000"
@@ -112,7 +112,7 @@ func TestJoinEmptyCell(t *testing.T) {
 	// Join returns an error only for serious problems such as the Sax cell isn't created.
 	// Even if the admin server momentarily disappears or has never existed, the Join call doesn't
 	// return any error but the best-effort background watcher will print log warnings.
-	if err := location.Join(ctx, saxCell, modelAddr, "", specs, 0); err != nil {
+	if err := location.Join(ctx, saxCell, modelAddr, "", "", specs, 0); err != nil {
 		t.Errorf("Join(%s) error %v, want no error", err, saxCell)
 	}
 }
@@ -121,7 +121,7 @@ func TestJoinEmptyCell(t *testing.T) {
 func TestLeaderElection(t *testing.T) {
 	ctx := context.Background()
 	saxCell := "/sax/test-election"
-	testutil.SetUp(ctx, t, saxCell)
+	testutil.SetUp(ctx, t, saxCell, "")
 
 	numParticipants := 5
 	var wg sync.WaitGroup

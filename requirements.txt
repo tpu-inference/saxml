@@ -29,8 +29,10 @@ absl-py==1.4.0
     #   tensorflow-datasets
     #   tensorflow-metadata
     #   tfds-nightly
-anyio==4.0.0
-    # via jupyter-server
+anyio==4.3.0
+    # via
+    #   httpx
+    #   jupyter-server
 argon2-cffi==23.1.0
     # via jupyter-server
 argon2-cffi-bindings==21.2.0
@@ -39,37 +41,40 @@ array-record==0.5.0
     # via tfds-nightly
 arrow==1.3.0
     # via isoduration
-asttokens==2.4.0
+asttokens==2.4.1
     # via stack-data
 astunparse==1.6.3
     # via tensorflow
 async-lru==2.0.4
     # via jupyterlab
-attrs==23.1.0
+attrs==23.2.0
     # via
     #   jsonschema
     #   lingvo
     #   referencing
-babel==2.13.0
+babel==2.14.0
     # via
     #   jupyterlab-server
     #   t5
-backcall==0.2.0
-    # via ipython
-beautifulsoup4==4.12.2
+beautifulsoup4==4.12.3
     # via nbconvert
 bleach==6.1.0
     # via nbconvert
-cachetools==5.3.1
+cachetools==5.3.3
     # via google-auth
-certifi==2023.7.22
-    # via requests
+certifi==2024.2.2
+    # via
+    #   httpcore
+    #   httpx
+    #   requests
 cffi==1.16.0
     # via argon2-cffi-bindings
-charset-normalizer==3.3.0
+charset-normalizer==3.3.2
     # via requests
-chex==0.1.7
-    # via optax
+chex==0.1.85
+    # via
+    #   optax
+    #   praxis
 click==8.1.7
     # via
     #   nltk
@@ -83,19 +88,19 @@ clu==0.0.10
     #   seqio-nightly
 colorama==0.4.6
     # via sacrebleu
-comm==0.1.4
+comm==0.2.1
     # via
     #   ipykernel
     #   ipywidgets
 contextlib2==21.6.0
     # via ml-collections
-contourpy==1.1.1
+contourpy==1.2.0
     # via matplotlib
 cycler==0.12.1
     # via matplotlib
-dataclasses-json==0.6.1
+dataclasses-json==0.6.4
     # via orbax-export
-debugpy==1.8.0
+debugpy==1.8.1
     # via ipykernel
 decorator==5.1.1
     # via ipython
@@ -108,14 +113,14 @@ dm-tree==0.1.8
     #   tfds-nightly
 docstring-parser==0.15
     # via pyglove
-editdistance==0.6.2
+editdistance==0.8.1
     # via
     #   seqio
     #   seqio-nightly
     #   t5
 einops==0.7.0
     # via praxis
-etils[enp,epath,epy]==1.5.1
+etils[enp,epath,epy]==1.7.0
     # via
     #   array-record
     #   clu
@@ -126,17 +131,17 @@ etils[enp,epath,epy]==1.5.1
     #   praxis
     #   tensorflow-datasets
     #   tfds-nightly
-exceptiongroup==1.1.3
+exceptiongroup==1.2.0
     # via
     #   anyio
     #   ipython
-executing==2.0.0
+executing==2.0.1
     # via stack-data
-fastjsonschema==2.18.1
+fastjsonschema==2.19.1
     # via nbformat
 fiddle==0.2.11
     # via praxis
-filelock==3.12.4
+filelock==3.13.1
     # via
     #   huggingface-hub
     #   transformers
@@ -147,15 +152,15 @@ flax==0.7.4
     #   clu
     #   paxml
     #   praxis
-fonttools==4.43.1
+fonttools==4.49.0
     # via matplotlib
 fqdn==1.5.1
     # via jsonschema
-fsspec==2023.9.2
+fsspec==2024.2.0
     # via
     #   etils
     #   huggingface-hub
-future==0.18.3
+future==1.0.0
     # via mesh-tensorflow
 gast==0.4.0
     # via tensorflow
@@ -163,7 +168,7 @@ gin-config==0.5.0
     # via
     #   mesh-tensorflow
     #   t5
-google-auth==2.23.3
+google-auth==2.28.1
     # via
     #   google-auth-oauthlib
     #   tensorboard
@@ -171,7 +176,7 @@ google-auth-oauthlib==0.4.6
     # via tensorboard
 google-pasta==0.2.0
     # via tensorflow
-googleapis-common-protos==1.61.0
+googleapis-common-protos==1.62.0
     # via tensorflow-metadata
 graph-compression-google-research==0.0.4
     # via lingvo
@@ -179,7 +184,7 @@ graphviz==0.20.1
     # via
     #   fiddle
     #   paxml
-grpcio==1.59.0
+grpcio==1.62.0
     # via
     #   -r requirements.in
     #   grpcio-reflection
@@ -187,38 +192,43 @@ grpcio==1.59.0
     #   tensorflow
 grpcio-reflection==1.48.2
     # via -r requirements.in
+h11==0.14.0
+    # via httpcore
 h5py==3.10.0
     # via tensorflow
-huggingface-hub==0.17.3
+httpcore==1.0.4
+    # via httpx
+httpx==0.27.0
+    # via jupyterlab
+huggingface-hub==0.21.4
     # via
     #   tokenizers
     #   transformers
-idna==3.4
+idna==3.6
     # via
     #   anyio
+    #   httpx
     #   jsonschema
     #   requests
-immutabledict==3.0.0
+immutabledict==4.2.0
     # via t5
-importlib-metadata==6.8.0
+importlib-metadata==7.0.2
     # via -r requirements.in
-importlib-resources==6.1.0
+importlib-resources==6.1.3
     # via etils
-ipykernel==6.25.2
+ipykernel==6.29.3
     # via
     #   jupyter
     #   jupyter-console
     #   jupyterlab
     #   lingvo
     #   qtconsole
-ipython==8.16.1
+ipython==8.22.2
     # via
     #   ipykernel
     #   ipywidgets
     #   jupyter-console
-ipython-genutils==0.2.0
-    # via qtconsole
-ipywidgets==8.1.1
+ipywidgets==8.1.2
     # via jupyter
 isoduration==20.11.0
     # via jsonschema
@@ -247,11 +257,11 @@ jaxlib==0.4.18
     #   orbax-export
     #   seqio
     #   seqio-nightly
-jaxtyping==0.2.23
+jaxtyping==0.2.28
     # via praxis
 jedi==0.19.1
     # via ipython
-jinja2==3.1.2
+jinja2==3.1.3
     # via
     #   jupyter-server
     #   jupyterlab
@@ -261,20 +271,20 @@ joblib==1.3.2
     # via
     #   nltk
     #   scikit-learn
-json5==0.9.14
+json5==0.9.22
     # via jupyterlab-server
 jsonpointer==2.4
     # via jsonschema
-jsonschema[format-nongpl]==4.19.1
+jsonschema[format-nongpl]==4.21.1
     # via
     #   jupyter-events
     #   jupyterlab-server
     #   nbformat
-jsonschema-specifications==2023.7.1
+jsonschema-specifications==2023.12.1
     # via jsonschema
 jupyter==1.0.0
     # via lingvo
-jupyter-client==8.4.0
+jupyter-client==8.6.0
     # via
     #   ipykernel
     #   jupyter-console
@@ -283,7 +293,7 @@ jupyter-client==8.4.0
     #   qtconsole
 jupyter-console==6.6.3
     # via jupyter
-jupyter-core==5.4.0
+jupyter-core==5.7.1
     # via
     #   ipykernel
     #   jupyter-client
@@ -294,30 +304,30 @@ jupyter-core==5.4.0
     #   nbconvert
     #   nbformat
     #   qtconsole
-jupyter-events==0.8.0
+jupyter-events==0.9.0
     # via jupyter-server
 jupyter-http-over-ws==0.0.8
     # via lingvo
-jupyter-lsp==2.2.0
+jupyter-lsp==2.2.4
     # via jupyterlab
-jupyter-server==2.8.0
+jupyter-server==2.13.0
     # via
     #   jupyter-lsp
     #   jupyterlab
     #   jupyterlab-server
     #   notebook
     #   notebook-shim
-jupyter-server-terminals==0.4.4
+jupyter-server-terminals==0.5.2
     # via jupyter-server
-jupyterlab==4.0.7
+jupyterlab==4.1.4
     # via notebook
-jupyterlab-pygments==0.2.2
+jupyterlab-pygments==0.3.0
     # via nbconvert
-jupyterlab-server==2.25.0
+jupyterlab-server==2.25.3
     # via
     #   jupyterlab
     #   notebook
-jupyterlab-widgets==3.0.9
+jupyterlab-widgets==3.0.10
     # via ipywidgets
 keras==2.9.0
     # via tensorflow
@@ -327,28 +337,28 @@ kiwisolver==1.4.5
     # via matplotlib
 libclang==16.0.6
     # via tensorflow
-libcst==1.1.0
+libcst==1.2.0
     # via fiddle
-libtpu-nightly==0.1.dev20231006
+libtpu-nightly==0.1.dev20240224
     # via jax
 lingvo==0.12.7
     # via
     #   paxml
     #   praxis
-lxml==4.9.3
+lxml==5.1.0
     # via sacrebleu
-markdown==3.5
+markdown==3.5.2
     # via tensorboard
 markdown-it-py==3.0.0
     # via rich
-markupsafe==2.1.3
+markupsafe==2.1.5
     # via
     #   jinja2
     #   nbconvert
     #   werkzeug
-marshmallow==3.20.1
+marshmallow==3.21.1
     # via dataclasses-json
-matplotlib==3.8.0
+matplotlib==3.8.3
     # via lingvo
 matplotlib-inline==0.1.6
     # via
@@ -357,14 +367,12 @@ matplotlib-inline==0.1.6
 mdurl==0.1.2
     # via markdown-it-py
 mesh-tensorflow[transformer]==0.1.21
-    # via
-    #   mesh-tensorflow
-    #   t5
+    # via t5
 mistune==3.0.2
     # via nbconvert
 ml-collections==0.1.1
     # via clu
-ml-dtypes==0.3.1
+ml-dtypes==0.3.2
     # via
     #   jax
     #   jaxlib
@@ -373,15 +381,15 @@ model-pruning-google-research==0.0.5
     # via lingvo
 mpmath==1.3.0
     # via sympy
-msgpack==1.0.7
+msgpack==1.0.8
     # via
     #   flax
     #   orbax-checkpoint
 mypy-extensions==1.0.0
     # via typing-inspect
-nbclient==0.8.0
+nbclient==0.9.0
     # via nbconvert
-nbconvert==7.9.2
+nbconvert==7.16.2
     # via
     #   jupyter
     #   jupyter-server
@@ -390,7 +398,7 @@ nbformat==5.9.2
     #   jupyter-server
     #   nbclient
     #   nbconvert
-nest-asyncio==1.5.8
+nest-asyncio==1.6.0
     # via
     #   ipykernel
     #   orbax-checkpoint
@@ -398,15 +406,15 @@ nltk==3.8.1
     # via
     #   rouge-score
     #   t5
-notebook==7.0.6
+notebook==7.1.1
     # via
     #   jupyter
     #   jupyter-http-over-ws
-notebook-shim==0.2.3
+notebook-shim==0.2.4
     # via
     #   jupyterlab
     #   notebook
-numpy==1.23.1
+numpy==1.26.4
     # via
     #   -r requirements.in
     #   chex
@@ -449,20 +457,20 @@ opt-einsum==3.3.0
     #   jax
     #   praxis
     #   tensorflow
-optax==0.1.7
+optax==0.2.1
     # via
     #   flax
     #   praxis
 optax-shampoo==0.0.6
     # via praxis
-orbax-checkpoint==0.4.1
+orbax-checkpoint==0.5.3
     # via
     #   flax
     #   orbax-export
     #   paxml
 orbax-export==0.0.3
     # via -r requirements.in
-overrides==7.4.0
+overrides==7.7.0
     # via jupyter-server
 packaging==23.2
     # via
@@ -481,23 +489,21 @@ packaging==23.2
     #   seqio-nightly
     #   tensorflow
     #   transformers
-pandas==2.1.1
+pandas==2.2.1
     # via t5
-pandocfilters==1.5.0
+pandocfilters==1.5.1
     # via nbconvert
 parso==0.8.3
     # via jedi
 paxml==1.2.0
     # via -r requirements.in
-pexpect==4.8.0
+pexpect==4.9.0
     # via ipython
-pickleshare==0.7.5
-    # via ipython
-pillow==10.1.0
+pillow==10.2.0
     # via
     #   lingvo
     #   matplotlib
-platformdirs==3.11.0
+platformdirs==4.2.0
     # via jupyter-core
 portalocker==2.8.2
     # via sacrebleu
@@ -507,17 +513,17 @@ praxis @ git+https://github.com/tpu-inference/praxis@mlperf4.0
     # via
     #   -r requirements.in
     #   paxml
-prometheus-client==0.17.1
+prometheus-client==0.20.0
     # via jupyter-server
 promise==2.3
     # via
     #   tensorflow-datasets
     #   tfds-nightly
-prompt-toolkit==3.0.39
+prompt-toolkit==3.0.43
     # via
     #   ipython
     #   jupyter-console
-protobuf==3.20.3
+protobuf==3.19.6
     # via
     #   googleapis-common-protos
     #   grpcio-reflection
@@ -532,7 +538,7 @@ protobuf==3.20.3
     #   tensorflow-hub
     #   tensorflow-metadata
     #   tfds-nightly
-psutil==5.9.6
+psutil==5.9.8
     # via
     #   ipykernel
     #   portpicker
@@ -544,7 +550,7 @@ ptyprocess==0.7.0
     #   terminado
 pure-eval==0.2.2
     # via stack-data
-pyasn1==0.5.0
+pyasn1==0.5.1
     # via
     #   pyasn1-modules
     #   rsa
@@ -552,21 +558,21 @@ pyasn1-modules==0.3.0
     # via google-auth
 pycparser==2.21
     # via cffi
-pyglove==0.4.3
+pyglove==0.4.4
     # via
     #   paxml
     #   seqio
     #   seqio-nightly
-pygments==2.16.1
+pygments==2.17.2
     # via
     #   ipython
     #   jupyter-console
     #   nbconvert
     #   qtconsole
     #   rich
-pyparsing==3.1.1
+pyparsing==3.1.2
     # via matplotlib
-python-dateutil==2.8.2
+python-dateutil==2.9.0.post0
     # via
     #   arrow
     #   jupyter-client
@@ -574,7 +580,7 @@ python-dateutil==2.8.2
     #   pandas
 python-json-logger==2.0.7
     # via jupyter-events
-pytz==2023.3.post1
+pytz==2024.1
     # via pandas
 pyyaml==6.0.1
     # via
@@ -585,23 +591,23 @@ pyyaml==6.0.1
     #   ml-collections
     #   orbax-checkpoint
     #   transformers
-pyzmq==25.1.1
+pyzmq==25.1.2
     # via
     #   ipykernel
     #   jupyter-client
     #   jupyter-console
     #   jupyter-server
     #   qtconsole
-qtconsole==5.4.4
+qtconsole==5.5.1
     # via jupyter
-qtpy==2.4.0
+qtpy==2.4.1
     # via qtconsole
-referencing==0.30.2
+referencing==0.33.0
     # via
     #   jsonschema
     #   jsonschema-specifications
     #   jupyter-events
-regex==2023.10.3
+regex==2023.12.25
     # via
     #   nltk
     #   sacrebleu
@@ -626,25 +632,25 @@ rfc3986-validator==0.1.1
     # via
     #   jsonschema
     #   jupyter-events
-rich==13.6.0
+rich==13.7.1
     # via flax
 rouge-score==0.1.2
     # via t5
-rpds-py==0.10.6
+rpds-py==0.18.0
     # via
     #   jsonschema
     #   referencing
 rsa==4.9
     # via google-auth
-sacrebleu==2.3.1
+sacrebleu==2.4.0
     # via t5
-safetensors==0.4.0
+safetensors==0.4.2
     # via transformers
-scikit-learn==1.3.1
+scikit-learn==1.4.1.post1
     # via
     #   lingvo
     #   t5
-scipy==1.11.3
+scipy==1.12.0
     # via
     #   jax
     #   jaxlib
@@ -656,6 +662,7 @@ send2trash==1.8.2
 sentencepiece==0.1.99
     # via
     #   lingvo
+    #   praxis
     #   seqio
     #   seqio-nightly
     #   t5
@@ -681,8 +688,10 @@ six==1.16.0
     #   rouge-score
     #   t5
     #   tensorflow
-sniffio==1.3.0
-    # via anyio
+sniffio==1.3.1
+    # via
+    #   anyio
+    #   httpx
 soupsieve==2.5
     # via beautifulsoup4
 stack-data==0.6.3
@@ -713,11 +722,11 @@ tensorflow-datasets==4.8.3
     #   praxis
 tensorflow-estimator==2.9.0
     # via tensorflow
-tensorflow-hub==0.15.0
+tensorflow-hub==0.16.1
     # via
     #   lingvo
     #   tensorflow-text
-tensorflow-io-gcs-filesystem==0.34.0
+tensorflow-io-gcs-filesystem==0.36.0
     # via tensorflow
 tensorflow-metadata==1.12.0
     # via
@@ -732,20 +741,22 @@ tensorflow-text==2.9.0
     #   praxis
     #   seqio
     #   seqio-nightly
-tensorstore==0.1.46
+tensorstore==0.1.54
     # via
     #   flax
     #   orbax-checkpoint
     #   paxml
-termcolor==2.3.0
+termcolor==2.4.0
     # via
     #   tensorflow
     #   tensorflow-datasets
     #   tfds-nightly
-terminado==0.17.1
+terminado==0.18.0
     # via
     #   jupyter-server
     #   jupyter-server-terminals
+tf-keras==2.15.0
+    # via tensorflow-hub
 tfds-nightly==4.8.3.dev202303280045
     # via
     #   paxml
@@ -753,11 +764,11 @@ tfds-nightly==4.8.3.dev202303280045
     #   seqio
     #   seqio-nightly
     #   t5
-threadpoolctl==3.2.0
+threadpoolctl==3.3.0
     # via scikit-learn
 tinycss2==1.2.1
     # via nbconvert
-tokenizers==0.14.1
+tokenizers==0.15.2
     # via transformers
 toml==0.10.2
     # via
@@ -765,9 +776,9 @@ toml==0.10.2
     #   tfds-nightly
 tomli==2.0.1
     # via jupyterlab
-toolz==0.12.0
+toolz==0.12.1
     # via chex
-tornado==6.3.3
+tornado==6.4
     # via
     #   ipykernel
     #   jupyter-client
@@ -776,14 +787,14 @@ tornado==6.3.3
     #   jupyterlab
     #   notebook
     #   terminado
-tqdm==4.66.1
+tqdm==4.66.2
     # via
     #   huggingface-hub
     #   nltk
     #   tensorflow-datasets
     #   tfds-nightly
     #   transformers
-traitlets==5.11.2
+traitlets==5.14.1
     # via
     #   comm
     #   ipykernel
@@ -800,7 +811,7 @@ traitlets==5.11.2
     #   nbconvert
     #   nbformat
     #   qtconsole
-transformers==4.34.1
+transformers==4.38.2
     # via
     #   -r requirements.in
     #   t5
@@ -808,10 +819,11 @@ typeguard==2.13.3
     # via
     #   jaxtyping
     #   praxis
-types-python-dateutil==2.8.19.14
+types-python-dateutil==2.8.19.20240106
     # via arrow
-typing-extensions==4.8.0
+typing-extensions==4.10.0
     # via
+    #   anyio
     #   async-lru
     #   chex
     #   clu
@@ -819,7 +831,6 @@ typing-extensions==4.8.0
     #   fiddle
     #   flax
     #   huggingface-hub
-    #   jaxtyping
     #   libcst
     #   orbax-checkpoint
     #   tensorflow
@@ -828,13 +839,13 @@ typing-inspect==0.9.0
     # via
     #   dataclasses-json
     #   libcst
-tzdata==2023.3
+tzdata==2024.1
     # via pandas
 uri-template==1.3.0
     # via jsonschema
-urllib3==2.0.7
+urllib3==2.2.1
     # via requests
-wcwidth==0.2.8
+wcwidth==0.2.13
     # via prompt-toolkit
 webcolors==1.13
     # via jsonschema
@@ -842,17 +853,17 @@ webencodings==0.5.1
     # via
     #   bleach
     #   tinycss2
-websocket-client==1.6.4
+websocket-client==1.7.0
     # via jupyter-server
-werkzeug==3.0.0
+werkzeug==3.0.1
     # via tensorboard
-wheel==0.41.2
+wheel==0.42.0
     # via
     #   astunparse
     #   tensorboard
-widgetsnbextension==4.0.9
+widgetsnbextension==4.0.10
     # via ipywidgets
-wrapt==1.15.0
+wrapt==1.16.0
     # via
     #   clu
     #   tensorflow
@@ -864,7 +875,7 @@ zipp==3.17.0
     #   importlib-metadata
 
 # The following packages are considered to be unsafe in a requirements file:
-setuptools==68.2.2
+setuptools==69.1.1
     # via
     #   tensorboard
     #   tensorflow
