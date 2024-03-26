@@ -81,7 +81,7 @@ click==8.1.7
     #   nltk
     #   tensorflow-datasets
     #   tfds-nightly
-clu @ git+https://github.com/google/CommonLoopUtils
+clu==0.0.10
     # via
     #   paxml
     #   praxis
@@ -109,6 +109,7 @@ defusedxml==0.7.1
     # via nbconvert
 dm-tree==0.1.8
     # via
+    #   chex
     #   tensorflow-datasets
     #   tfds-nightly
 docstring-parser==0.15
@@ -139,7 +140,7 @@ executing==2.0.1
     # via stack-data
 fastjsonschema==2.19.1
     # via nbformat
-fiddle @ git+https://github.com/google/fiddle
+fiddle==0.2.11
     # via praxis
 filelock==3.13.1
     # via
@@ -147,7 +148,7 @@ filelock==3.13.1
     #   transformers
 flatbuffers==1.12
     # via tensorflow
-flax @ git+https://github.com/google/flax
+flax==0.7.4
     # via
     #   clu
     #   paxml
@@ -232,7 +233,7 @@ ipywidgets==8.1.2
     # via jupyter
 isoduration==20.11.0
     # via jsonschema
-jax[cuda12-pip,tpu]==0.4.25
+jax[cuda,tpu]==0.4.18
     # via
     #   -r requirements-cuda.in
     #   -r requirements.in
@@ -248,7 +249,7 @@ jax[cuda12-pip,tpu]==0.4.25
     #   seqio-nightly
 jax-bitempered-loss==0.0.2
     # via praxis
-jaxlib==0.4.25+cuda12.cudnn89
+jaxlib==0.4.18+cuda11.cudnn86
     # via
     #   chex
     #   clu
@@ -526,7 +527,7 @@ pandocfilters==1.5.1
     # via nbconvert
 parso==0.8.3
     # via jedi
-paxml @ git+https://github.com/google/paxml
+paxml==1.2.0
     # via -r requirements.in
 pexpect==4.9.0
     # via ipython
@@ -540,7 +541,7 @@ portalocker==2.8.2
     # via sacrebleu
 portpicker==1.6.0
     # via -r requirements.in
-praxis @ git+https://github.com/google/praxis
+praxis==1.2.0
     # via
     #   -r requirements.in
     #   paxml
