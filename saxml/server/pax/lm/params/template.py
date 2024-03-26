@@ -294,7 +294,7 @@ class ServingTemplate(
         else (self.INPUT_SEQ_LEN + max_decode_steps)
     )
 
-    if self.NUM_SAMPLES == 1 and self.TOP_K == 1:
+    if self.NUM_SAMPLES == 1 and self.TOP_K == 1 and self.NUM_CACHE_SLOTS > 0:
       generate_hparams = decoder_hparams.GreedyDecoderHParams(
           fprop_for_prefix=self.FPROP_FOR_PREFIX,
           min_decode_steps=self.MIN_DECODE_STEPS,

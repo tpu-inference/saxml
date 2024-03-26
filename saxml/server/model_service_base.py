@@ -142,7 +142,7 @@ class MethodKey:
   service_id: Optional[str] = None
   model_key: Optional[str] = None
 
-  def method_name(self) -> str:
+  def method_name(self) -> str | None:
     if self.name == MethodName.MODEL:
       return self.model_method
     return str(self.name)
@@ -259,7 +259,7 @@ class PrefillRequest:
   """
 
   preprocessed_inputs: DeviceTensors | None
-  rpc_task: utils.RpcQueueTask
+  rpc_tasks: Sequence[utils.RpcQueueTask]
   enqueue_time: float
 
 
@@ -344,7 +344,7 @@ class ContinuousBatchingState:
     # runs in FIFO order.
     self.post_process_pool = utils.ThreadPool(
         num_threads=1,
-        thread_name_prefix='model_service_runner_post_processer',
+        thread_name_prefix='model_service_runner_post_processor',
     )
     self.generate_cv = threading.Condition()
     self.available_slots = queue.SimpleQueue()
@@ -536,6 +536,7 @@ class PerMethodBatcher:
           MethodKey,
           utils.RequestStats.Stats,
           utils.RequestStats.Stats,
+          int,
           List[int],
       ]
   ]:
@@ -547,6 +548,7 @@ class PerMethodBatcher:
           mkey,
           method.ok_stats.get(100),
           method.err_stats.get(1),
+          method.batch_size,
           list(method.recent_batch_sizes),
       ))
     return ret
@@ -579,7 +581,7 @@ class PerMethodBatcher:
       return done(utils.not_found(f'method {key} is unloaded'))
 
     # Check ACLs.
-    model: servable_model.ServableModel = method.model
+    model: servable_model.ServableModel | None = method.model
 
     if model is not None and key.model_method is not None:
       model_method_name: str = key.model_method
@@ -668,7 +670,7 @@ class LoadedModelManager:
       ckpt_path: Path of the checkpoint.
       acls: ACL names for this model's methods.
       overrides: Overrides that can be used for dynamic reconfiguration of
-        params. Values must be serialized JSONs.
+        params.
       prng_key: PRNG key for this model.
       register_methods_callback: Optional callback to initialize model methods.
 
@@ -691,11 +693,7 @@ class LoadedModelManager:
         raise ValueError(f'{model_path} is not a ServableModelParams')
       # pytype: disable=not-instantiable
       params = model_class()
-      parsed_overrides = {
-          key: json.loads(value) for key, value in overrides.items()
-      }
-      logging.info('model_service_base overrides= %s', parsed_overrides)
-      params.apply_model_overrides(parsed_overrides)
+      params.apply_model_overrides(overrides)
       loaded = params.load(key, ckpt_path, self._primary_process_id, prng_key)
       # pytype: enable=not-instantiable
       loaded.set_acls(acls)
@@ -977,6 +975,7 @@ class ModeletService:
       admin_port: Optional[int],
       platform_chip: Optional[str],
       platform_topology: Optional[str],
+      tags: Optional[List[str]],
       *args,
       **kwargs,
   ):
@@ -1044,6 +1043,7 @@ class ModeletService:
           logging.info('Servable model alias %s for %s', alias, k)
           self._loadable_model_paths.append(alias)
 
+    self._tags = tags
     self._ipport = ipaddr.Join(ipaddr.MyIPAddr(), service_port)
     self._debug_addr = (
         '' if debug_port is None else ipaddr.Join(ipaddr.MyIPAddr(), debug_port)
@@ -1063,6 +1063,7 @@ class ModeletService:
           chip_type=self._platform_chip,
           chip_topology=self._platform_topology,
           servable_model_paths=list(self._loadable_model_paths),
+          tags=self._tags
       )
       try:
         location.Join(
@@ -1193,6 +1194,7 @@ class ModeletService:
           key,
           ok_stats,
           err_stats,
+          _,
           recent_batch_sizes,
       ) in self._batcher.get_method_stats():
         if (
@@ -1330,6 +1332,7 @@ class ModelServicesRunner:
       admin_port: Optional[int] = None,
       platform_chip: Optional[str] = None,
       platform_topology: Optional[str] = None,
+      tags: Optional[List[str]] = None,
       backend: Optional[spmd_backend.SPMDBackend] = None,
       fail_on_error: bool = False,
   ):
@@ -1414,6 +1417,7 @@ class ModelServicesRunner:
         admin_port=admin_port,
         platform_chip=platform_chip,
         platform_topology=platform_topology,
+        tags=tags
     )
     self._platform_topology = platform_topology
     all_grpc_services = [self._modelet_service]
@@ -1598,7 +1602,7 @@ class ModelServicesRunner:
           padded_shape = method.get_padded_input_shape(unpadded_shape)
           if prefill:
             res = method.input_to_device_for_continuous_batching(
-                inputs, unpadded_shape
+                inputs, unpadded_shape, padded_shape
             )
           else:
             res = method.input_to_device(inputs, unpadded_shape, padded_shape)
@@ -1632,13 +1636,14 @@ class ModelServicesRunner:
           self._batcher.register_method(
               model,
               batch_generate_method_key,
-              1,
+              method.batch_size,
               preprocess_fn=functools.partial(
                   preprocess_rpc_tasks, prefill=True
               ),
-              # Note: batch size of this method is always 1 so max_live_batches
-              # denotes the number of live requests.
-              max_live_batches=method.num_cache_slots * 2,
+              # Each batch has `batch_size` requests and we should have at least
+              # `num_cache_slots` * 2 live requests
+              max_live_batches=method.num_cache_slots * 2 // method.batch_size,
+              batching_wait_secs=method.batching_wait_secs,
           )
 
     model = self._loaded_models.load(
@@ -2041,7 +2046,6 @@ class ModelServicesRunner:
         case MethodName.BATCHED_LM_GENERATE:
           try:
             batch.wait_for_ready()
-            assert len(batch.rpc_tasks) == 1
 
             key = (batch.method.model_key, batch.method.model_method)
             assert key in self._continuous_batching_state, (
@@ -2054,7 +2058,7 @@ class ModelServicesRunner:
             state.prefill_queue.put(
                 PrefillRequest(
                     preprocessed_inputs=batch.input_tensors,
-                    rpc_task=batch.rpc_tasks[0],
+                    rpc_tasks=batch.rpc_tasks,
                     enqueue_time=time.time(),
                 )
             )
@@ -2083,12 +2087,22 @@ class ModelServicesRunner:
     while True:
       # Block if there is no prefill requests.
       request = state.prefill_queue.get()
+      n_tasks = len(request.rpc_tasks)
       # Block if there is no available cache slot.
-      slot = state.available_slots.get()
+      slots = []
+      for i in range(n_tasks):
+        slots.append(state.available_slots.get())
+        # Wake up the generation loop when no available slot is left
+        if state.available_slots.empty() and i < n_tasks - 1:
+          state.pending_insert = False
+          with state.generate_cv:
+            state.generate_cv.notify()
+      slots = tuple(slots)
+
       prefill_dequeue_time = time.time()
 
-      # Take an unused slot.
-      logging.info('Taking slot %d', slot)
+      # Take unused slots.
+      logging.info('Taking slots %s', slots)
 
       # Atomic mutation. Safe to be outside of generate_cv guard.
       state.pending_insert = True
@@ -2098,12 +2112,12 @@ class ModelServicesRunner:
               MethodName.PREFILL_INSERT,
               state.model_key,
               state.model_method,
-              str(slot),
+              ','.join([str(s) for s in slots]),
               skip_host_sync=True,
           )
 
           assert request.preprocessed_inputs is not None
-          assert request.rpc_task is not None
+          assert request.rpc_tasks is not None
 
           scores, tokens, prefix_cache = method_obj.prefill(
               inputs=request.preprocessed_inputs,
@@ -2113,24 +2127,24 @@ class ModelServicesRunner:
               insert_wait_time=time.time() - prefill_dequeue_time,
           )
 
-          method_obj.insert(prefix_cache, slot)
+          method_obj.insert(prefix_cache, slots)
 
         host_tokens = np.array(tokens.addressable_data(0))
         host_scores = np.array(scores.addressable_data(0))
-        state.decoded_tokens[slot][0] = host_tokens
-        state.scores[slot] = host_scores
+        state.decoded_tokens[slots, 0] = host_tokens[:n_tasks]
+        state.scores[slots, ...] = host_scores[:n_tasks]
 
         self._run_post_prefill_async(
             state,
-            slot,
+            slots,
             copy.deepcopy(host_tokens),
             copy.deepcopy(host_scores),
-            request.rpc_task,
+            request.rpc_tasks,
         )
-        state.steps[slot] = 1
+        state.steps[slots, ...] = 1
 
         # Must set slots_in_use in the end.
-        state.slots_in_use[slot] = 1
+        state.slots_in_use[slots, ...] = 1
 
         # Don't wake up the generate thread if there are more pending requests
         # and empty slots.
@@ -2139,30 +2153,43 @@ class ModelServicesRunner:
           state.generate_cv.notify()
 
   # pylint: disable=unused-argument
-  def _run_post_prefill_async(self, state, slot, tokens, scores, request_rpc):
+  def _run_post_prefill_async(self, state, slots, tokens, scores, request_rpcs):
     """Runs the post-prefill processing on a dedicated thread."""
 
+    n_tasks = len(slots)
+    assert n_tasks == len(request_rpcs)
+
     def _postprocess():
-      state.rpc_tasks[slot] = request_rpc
+      for i, slot in enumerate(slots):
+        state.rpc_tasks[slot] = request_rpcs[i]
 
       if state.method.streamable_output:
         nonlocal tokens
         nonlocal scores
-        tokens = np.expand_dims(tokens, axis=0)
-        scores = np.expand_dims(scores, axis=0)
 
-        output_strings = state.method.detokenize(tokens)
-        outputs = output_strings, scores
-        resp = copy.deepcopy(state.rpc_tasks[slot].response)
-        self._model_services[state.service_id].FillRPCResponse(
-            state.model_method, outputs, resp
+        assert len(tokens.shape) == 1, tokens.shape
+        assert len(scores.shape) == 1, scores.shape
+        assert tokens.shape[0] == scores.shape[0], (
+            scores.shape,
+            tokens.shape,
         )
-        try:
-          state.rpc_tasks[slot].done(utils.ok(), resp=resp)
-        except Exception as e:  # pylint: disable=broad-except
-          self._log_exception(
-              'Error occurred: %s, error: %s', state.model_key, e
+
+        scores = np.expand_dims(scores, axis=1)
+        tokens = np.expand_dims(tokens, axis=1)
+        output_strings = state.method.detokenize(tokens)
+
+        for i, slot in enumerate(slots):
+          resp = copy.deepcopy(state.rpc_tasks[slot].response)
+          outputs = output_strings[i], scores[i]
+          self._model_services[state.service_id].FillRPCResponse(
+              state.model_method, outputs, resp
           )
+          try:
+            state.rpc_tasks[slot].done(utils.ok(), resp=resp)
+          except Exception as e:  # pylint: disable=broad-except
+            self._log_exception(
+                'Error occurred: %s, error: %s', state.model_key, e
+            )
 
     state.post_process_pool.run(_postprocess)
 
@@ -2179,6 +2206,9 @@ class ModelServicesRunner:
         model_method,
     )
     method_obj = state.method
+
+    prev_result = None
+    prev_mask = None
     while True:
       with state.generate_cv:
         while not state.slots_in_use.any() or state.pending_insert:
@@ -2194,40 +2224,52 @@ class ModelServicesRunner:
               state.model_method,
               skip_host_sync=True,
           )
-          res = method_obj.generate()
+          current_result = method_obj.generate()
+          current_mask = state.slots_in_use.copy()
+
+        # Copy result to host
+        if prev_result is not None:
+          assert prev_mask is not None
           scores, tokens, done = method_obj.output_to_host(
-              res, unpadded_batch_size=state.num_cache_slots
+              prev_result, unpadded_batch_size=state.num_cache_slots
           )
-          state.generate_step_time.add(time.time() - start_ts)
 
-        state.decoded_tokens[np.arange(state.num_cache_slots), state.steps] = (
-            tokens
-        )
-        state.scores += scores * state.slots_in_use
-        state.steps += state.slots_in_use
+          state.decoded_tokens[
+              np.arange(state.num_cache_slots), state.steps
+          ] = tokens
 
-        done = done * state.slots_in_use
-        done = np.logical_or(done, state.steps >= state.max_decode_steps)
+          state.scores += scores * prev_mask
+          state.steps += prev_mask
+          done = done * prev_mask
 
-        if not np.any(done):
-          continue
+          done = np.logical_or(done, state.steps >= state.max_decode_steps)
 
-        self._run_post_generate_async(
-            state,
-            copy.deepcopy(state.decoded_tokens[done]),
-            copy.deepcopy(state.scores[done]),
-            done,
-        )
-        # Reset the cache slot state.
-        state.decoded_tokens[done] = 0
-        state.scores[done] = 0.0
-        state.steps[done] = 0
-        state.slots_in_use[done] = 0
+          if np.any(done):
+            # Detokenize and send RPC in another thread for done slots
+            self._run_post_generate_async(
+                state,
+                copy.deepcopy(state.decoded_tokens[done]),
+                copy.deepcopy(state.scores[done]),
+                done,
+            )
+            # Reset the cache slot state.
+            state.decoded_tokens[done] = 0
+            state.scores[done] = 0.0
+            state.steps[done] = 0
+            state.slots_in_use[done] = 0
 
-        # Release the slots.
-        for slot in np.flatnonzero(done):
-          logging.info('Releasing slot %d.', slot)
-          state.available_slots.put(slot)
+            # Discard stale run-ahead results
+            current_mask[done] = 0
+
+            # Release the slots.
+            for slot in np.flatnonzero(done):
+              logging.info('Releasing slot %d.', slot)
+              state.available_slots.put(slot)
+
+        prev_result = current_result
+        prev_mask = current_mask
+
+        state.generate_step_time.add(time.time() - start_ts)
 
   def _run_post_generate_async(
       self, state: ContinuousBatchingState, sequences, scores, done
@@ -2382,19 +2424,19 @@ class ModelServicesRunner:
             break
         case MethodName.PREFILL_INSERT:
           try:
-            model_key, model_method, slot = msgs
+            model_key, model_method, slots = msgs
             logging.info(
                 'Received PREFILL_INSERT model_key %s method %s slot %s',
                 model_key,
                 model_method,
-                slot,
+                slots,
             )
-            slot = int(slot)
+            slots = [int(s) for s in slots.split(',')]
             method_obj = self._loaded_models.get_model(model_key).method(
                 model_method
             )
             _, _, state = method_obj.prefill_with_dummy()
-            method_obj.insert(state, slot)
+            method_obj.insert(state, slots)
           except Exception as e:  # pylint: disable=broad-except
             self._worker_thread_exception = e
             break

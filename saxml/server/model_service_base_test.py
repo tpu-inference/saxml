@@ -50,6 +50,7 @@ class GetStatusTest(absltest.TestCase):
         admin_port=portpicker.pick_unused_port(),
         platform_chip='cpu',
         platform_topology='1',
+        tags=[]
     )
     mock_loader = self.enter_context(
         mock.patch.object(self._service, '_loader', autospec=True)
@@ -78,6 +79,7 @@ class GetStatusTest(absltest.TestCase):
             utils.RequestStats.Stats(
                 timespan_sec=8, total=1, summ=1, summ2=1, samples=np.array([1])
             ),
+            10,
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         ),
     ]

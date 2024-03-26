@@ -14,6 +14,10 @@ pytype_strict_library(
     srcs = ["all_imports.py"],
     srcs_version = "PY3",
     tags = ["keep_dep"],
+    visibility = [
+        "//learning/grp/managed_models:__subpackages__",
+        "//saxml:internal",
+    ],
     deps = [
         "//saxml/server:servable_model_registry",
         "//saxml/server/pax/lm/params:c4",
@@ -175,13 +179,14 @@ pytype_strict_library(
         "//third_party/py/praxis:pytypes",
         "//third_party/py/praxis/layers",
         "//third_party/py/praxis/layers:embedding_softmax",
+        "//third_party/py/praxis/layers:multi_query_attention",
     ],
 )
 
 py_strict_test(
     name = "layers_test",
     srcs = ["layers_test.py"],
-    shard_count = 1,
+    shard_count = 4,
     deps = [
         ":layers",
         "//third_party/py/absl-py/logging",

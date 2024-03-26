@@ -18,6 +18,7 @@ from typing import List, cast
 
 import jax
 from jax import numpy as jnp
+import numpy as np
 from paxml import base_experiment
 from paxml import tasks_lib
 from paxml.tasks.lm.params import lm_cloud
@@ -55,6 +56,7 @@ class BaseLLaMA(base_experiment.BaseExperiment):
   FPROP_DTYPE = jnp.bfloat16
   MODEL_DTYPE = jnp.bfloat16
   USE_MQA = False
+  GPU_FLASH_DECODING = False
 
   ACTIVATION_CLS = activations.SiLU
   USE_GATED_ACTIVATION = True
@@ -65,6 +67,7 @@ class BaseLLaMA(base_experiment.BaseExperiment):
   DCN_MESH_SHAPE = None
   DECODE_MESH_TRANSPOSE = None
   USE_BATCH_SHARDING = False
+  QUANTIZE_KV = False
 
   BATCH_SIZE = 1
   NUM_SAMPLES = 1
@@ -81,6 +84,12 @@ class BaseLLaMA(base_experiment.BaseExperiment):
       'per_example_max_decode_steps': 128,
       'per_example_top_k': 200,
       'per_example_top_p': 0.95,
+  }
+  EXTRA_INPUTS_DTYPES = {
+      'temperature': np.float32,
+      'per_example_max_decode_steps': np.int32,
+      'per_example_top_k': np.int32,
+      'per_example_top_p': np.float32,
   }
 
   # Disable continuous batching by default.
@@ -138,7 +147,24 @@ class BaseLLaMA(base_experiment.BaseExperiment):
     transformer_layer_p.norm_policy = 'pre'
     transformer_layer_p.ln_tpl = ln_tpl.clone()
 
-    if self.USE_MQA:
+    if self.USE_MQA and self.GPU_FLASH_DECODING:
+      from praxis.layers import gpu_fast_attention  # pylint: disable=g-import-not-at-top
+
+      transformer_layer_p.tr_atten_tpl = pax_fiddle.Config(
+          gpu_fast_attention.GpuTritonFusedMultiQueryDotProductAttention,
+          num_kv_heads=self.NUM_KV_HEADS,
+          chunked_attn_num_seq_split=self.ATTEN_NUM_SEQ_SPLITS,
+          use_flash_decoding=True,
+      )
+      transformer_layer_p.tr_atten_tpl.combine_qkv = False
+    elif self.USE_MQA and self.QUANTIZE_KV:
+      transformer_layer_p.tr_atten_tpl = pax_fiddle.Config(
+          sax_layers.QuantizedKVMQA,
+          num_kv_heads=self.NUM_KV_HEADS,
+          chunked_attn_num_seq_split=self.ATTEN_NUM_SEQ_SPLITS,
+      )
+      transformer_layer_p.tr_atten_tpl.combine_qkv = False
+    elif self.USE_MQA:
       transformer_layer_p.tr_atten_tpl = pax_fiddle.Config(
           multi_query_attention.MultiQueryDotProductAttention,
           num_kv_heads=self.NUM_KV_HEADS,
@@ -370,6 +396,34 @@ class LLaMA7BContinuousBatchingTPUv5e8(LLaMA7BTPUv5e4):
 
 
 @servable_model_registry.register
+class LLaMA7BH100BS8(LLaMA7BTPUv5e4):
+  """7B model on a H100."""
+
+  BATCH_SIZE = 8
+  NUM_CACHE_SLOTS = 0
+
+  ICI_MESH_SHAPE = [1, 1, 1]
+
+  @property
+  def test_mode(self) -> bool:
+    return False
+
+
+@servable_model_registry.register
+class LLaMA7BH100(LLaMA7BTPUv5e4):
+  """7B model on a H100."""
+
+  BATCH_SIZE = 8
+  NUM_CACHE_SLOTS = 16
+
+  ICI_MESH_SHAPE = [1, 1, 1]
+
+  @property
+  def test_mode(self) -> bool:
+    return False
+
+
+@servable_model_registry.register
 @quantization.for_transformer(quantize_on_the_fly=False)
 class LLaMA13B(BaseLLaMA):
   """13B model on a A100-40GB.
@@ -490,6 +544,7 @@ class LLaMA70BInt8TPUv5e8(LLaMA70BFP16TPUv5e):
 @quantization.for_transformer(quantize_on_the_fly=False, linear_only=True)
 class LLaMA70BInt8TokenizedInputTPUv5e8(LLaMA70BInt8TPUv5e8):
   """LlaMA-2 70B model for MLPerf4 on TPU V5e-8 devices."""
+
   TOKENIZED_INPUT = True
   TOKENIZED_OUTPUT = False
 
@@ -550,7 +605,9 @@ class LLaMA70BFP16H100x8(LLaMA70BFP16TPUv5e):
   ATTEN_NUM_SEQ_SPLITS = 8
 
   BATCH_SIZE = 1
-  NUM_CACHE_SLOTS = 128
+  NUM_CACHE_SLOTS = 64
+
+  GPU_FLASH_DECODING = True
 
   EXTRA_INPUTS = {
       'temperature': 0.5,
@@ -573,7 +630,27 @@ class LLaMA70BInt8H100x8(LLaMA70BFP16H100x8):
   REPEATED_LAYERS = False
   ICI_MESH_SHAPE = [1, 1, 8]
 
-  NUM_CACHE_SLOTS = 256
+  BATCH_SIZE = 32
+  NUM_CACHE_SLOTS = 128
+
+
+@servable_model_registry.register
+@quantization.for_transformer(quantize_on_the_fly=False, linear_only=True)
+class LLaMA70BInt8H100x8BS32(LLaMA70BFP16H100x8):
+  """LlaMA-2 70B model with pre-quantized int8 checkpoint on H100x8."""
+
+  BATCH_SIZE = 32
+  NUM_CACHE_SLOTS = 0
+
+
+@servable_model_registry.register
+@quantization.for_transformer(quantize_on_the_fly=False, linear_only=True)
+class LLaMA70BInt8H100x8Fake(LLaMA70BInt8H100x8):
+  """LlaMA-2 70B model with fake pre-quantized int8 checkpoint on H100x8."""
+
+  @property
+  def test_mode(self) -> bool:
+    return True
 
 
 # GPT-J/NeoX family
